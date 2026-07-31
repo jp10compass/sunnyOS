@@ -1,0 +1,1697 @@
+# -*- coding: utf-8 -*-
+"""SOS P&L Draft - Streamlit App
+
+FVRC P&L DETAIL CLEANING AND PROPERTY / BOOKING MAPPING
+
+Converted from a Google Colab notebook to run as a Streamlit app.
+
+Upload three files in the app:
+
+1. Original FVRC Profit and Loss Detail CSV
+2. Additional one-column property-list CSV
+3. Booking-to-property CSV with:
+      Lease ID
+      Unit Name
+"""
+
+import os
+import re
+import unicodedata
+from collections import defaultdict
+
+import pandas as pd
+import streamlit as st
+
+
+# ============================================================
+# HELPER FUNCTIONS
+# ============================================================
+
+def clean_text(value):
+    """
+    Clean text while preserving capitalization.
+
+    - Converts missing values to blank
+    - Normalizes Unicode characters
+    - Replaces non-breaking spaces
+    - Removes leading and trailing spaces
+    - Replaces repeated spaces with one space
+    """
+
+    if pd.isna(value):
+        return ""
+
+    text = str(value)
+    text = unicodedata.normalize("NFKC", text)
+    text = text.replace(" ", " ")
+    text = re.sub(r"\s+", " ", text)
+
+    return text.strip()
+
+
+def normalize_text(value):
+    """
+    Normalize text for comparisons.
+
+    Comparisons ignore:
+    - Capitalization
+    - Leading and trailing spaces
+    - Repeated spaces
+    """
+
+    return clean_text(value).casefold()
+
+
+def normalize_account_name(value):
+    """
+    Normalize Account Name values.
+
+    Also ignores spaces immediately before or after colons.
+    """
+
+    text = normalize_text(value)
+    text = re.sub(r"\s*:\s*", ":", text)
+
+    return text
+
+
+def normalize_booking_id(value):
+    """
+    Normalize booking IDs for matching.
+
+    - Converts to uppercase
+    - Removes spaces
+    - Standardizes different dash characters
+    """
+
+    text = clean_text(value).upper()
+
+    text = (
+        text
+        .replace("–", "-")
+        .replace("—", "-")
+        .replace("−", "-")
+    )
+
+    text = re.sub(r"\s+", "", text)
+
+    return text
+
+
+def read_csv_without_header(uploaded_file, skip_blank_lines=False):
+    """
+    Read a CSV without assigning a header row.
+    All values are imported as text.
+    """
+
+    uploaded_file.seek(0)
+
+    try:
+        return pd.read_csv(
+            uploaded_file,
+            header=None,
+            dtype=str,
+            keep_default_na=False,
+            skip_blank_lines=skip_blank_lines,
+            encoding="utf-8-sig"
+        )
+
+    except UnicodeDecodeError:
+        uploaded_file.seek(0)
+        return pd.read_csv(
+            uploaded_file,
+            header=None,
+            dtype=str,
+            keep_default_na=False,
+            skip_blank_lines=skip_blank_lines,
+            encoding="latin-1"
+        )
+
+
+def read_csv_with_header(uploaded_file):
+    """
+    Read a CSV whose first row contains headers.
+    All values are imported as text.
+    """
+
+    uploaded_file.seek(0)
+
+    try:
+        return pd.read_csv(
+            uploaded_file,
+            header=0,
+            dtype=str,
+            keep_default_na=False,
+            encoding="utf-8-sig"
+        )
+
+    except UnicodeDecodeError:
+        uploaded_file.seek(0)
+        return pd.read_csv(
+            uploaded_file,
+            header=0,
+            dtype=str,
+            keep_default_na=False,
+            encoding="latin-1"
+        )
+
+
+def find_column(dataframe, expected_column_name):
+    """
+    Find a column while ignoring capitalization and extra spaces.
+    """
+
+    expected_normalized = normalize_text(expected_column_name)
+
+    for column in dataframe.columns:
+
+        if normalize_text(column) == expected_normalized:
+            return column
+
+    available_columns = [
+        str(column)
+        for column in dataframe.columns
+    ]
+
+    raise KeyError(
+        f'The column "{expected_column_name}" was not found.\n'
+        f"Available columns: {available_columns}"
+    )
+
+
+# ============================================================
+# BASE VALID-PROPERTY LIST
+#
+# FVRC, BRI, and blank values are intentionally excluded.
+# ============================================================
+
+BASE_PROPERTIES_TEXT = """
+1012 Mandalay
+1015 Eldorado
+1021 Mandalay
+10265 115th Ave N
+1039 Union
+10738 126th Ave
+1122 Charles
+1289 Pierce 1
+1289 Pierce 2
+1289 Pierce 3
+1289 Pierce 4
+1565 S Jefferson
+1612 Lakeview
+16333 Gulf Blvd 215
+18 Heilwood 1
+18 Heilwood 2
+180 Devon
+19622 Gulf
+20 Kendall 1
+20 Kendall 2
+2008 20th Ave Parkway
+2009 Edgewater
+2025 Scotland Dr
+22 Laurel
+2200 Spanish Vista N
+2200 Spanish Vista S
+2201 Spanish Vista N
+2201 Spanish Vista S
+26 Heilwood
+2760 Gulf 2
+435 18th Avenue
+620 Bayway Unit 1
+676 Mandalay 111
+729 Bruce
+729 Mandalay
+733 Bay Esplanade
+739 Eldorado
+755 Bruce
+760 Bay Esplanade
+764 Mandalay Ave 2
+764 Mandalay Ave 2br
+770 Bay Esplanade
+770 Bay Unit 2
+770 Mandalay
+800 Lantana
+806 Lantana
+823 Eldorado Ave
+8500 Ulmerton 212
+865 Lantana
+870 1/2 Bruce
+870 Bay Esplanade
+870 Bruce
+917 Mandalay
+929 Bruce
+930 Mandalay
+934 Narcissus
+939 Narcissus
+944 Eldorado
+971 Eldorado
+980 Narcissus
+BH 403
+BH 71
+BW 1
+BW 2
+BW 3
+BW 6
+CBS 102
+CBS 103
+CBS 104
+CBS 105
+CBS 106
+CBS 107
+CBS 201
+CBS 202
+CBS 203
+CBS 204
+CBS 205
+CBS 206
+CR A1
+CR A4
+CR B1
+CR B2
+CR B5
+CR C2
+CR D1
+CR E2
+SK 601
+TT 10
+TT 11
+TT 12
+TT 15
+TT 16
+TT 18
+TT 19
+TT 21
+TT 22
+TT 23
+TT 24
+TT 26
+TT 27
+TT 29
+TT 3
+TT 31
+TT 32
+TT 35
+TT 37
+TT 38
+TT 39
+TT 4
+TT 40
+TT 41
+TT 44
+TT 45
+TT 48
+TT 49
+TT 50
+TT 51
+TT 54
+TT 55
+TT 56
+TT 59
+TT 8
+TT 9
+TT HOA
+"""
+
+BASE_PROPERTIES = [
+    clean_text(property_name)
+    for property_name
+    in BASE_PROPERTIES_TEXT.strip().splitlines()
+    if clean_text(property_name) != ""
+]
+
+
+# ============================================================
+# CORPORATE ACCOUNT LIST
+#
+# Corporate tagging runs before all other mapping.
+#
+# For these accounts:
+#
+# Property = Corporate
+# Booking  = Corporate
+# ============================================================
+
+CORPORATE_ACCOUNT_NAMES = [
+    "Accounting Fees",
+    "Bank Service Charges",
+    "Interest Expense",
+    "Licenses",
+    "Office Supplies",
+    "Payroll Costs",
+    "Payroll Costs:Employee Benefits",
+    "Payroll Costs:Payroll Fees",
+    "Payroll Costs:Payroll Guest Services",
+    "Payroll Costs:Payroll Taxes",
+    "Payroll Costs:Subcontractor Guest Services",
+    "Rent",
+    "Software",
+    "Telephone:Phone",
+    "Uncategorized Expense",
+    "Reconciliation Discrepancies",
+    "Tax Collection Allowance"
+]
+
+
+def build_property_regex(property_name):
+    """
+    Create a conservative property matching pattern.
+    """
+
+    normalized_property = normalize_text(
+        property_name
+    )
+
+    code_match = re.fullmatch(
+        r"(tt|bw|bh|cbs|cr|sk)\s+([a-z0-9]+)",
+        normalized_property
+    )
+
+    if code_match:
+
+        prefix = re.escape(
+            code_match.group(1)
+        )
+
+        property_code = re.escape(
+            code_match.group(2)
+        )
+
+        # Allows TT3 and TT 3
+        pattern_body = (
+            prefix
+            + r"\s*"
+            + property_code
+        )
+
+    else:
+
+        property_parts = (
+            normalized_property.split(" ")
+        )
+
+        pattern_body = r"\s+".join(
+            re.escape(part)
+            for part in property_parts
+        )
+
+    complete_pattern = (
+        r"(?<![a-z0-9])"
+        + pattern_body
+        + r"(?![a-z0-9])"
+    )
+
+    return re.compile(
+        complete_pattern
+    )
+
+
+def prepare_booking_source_text(value):
+    """
+    Normalize text before searching for booking references.
+    """
+
+    text = clean_text(value).upper()
+
+    text = (
+        text
+        .replace("–", "-")
+        .replace("—", "-")
+        .replace("−", "-")
+    )
+
+    return text
+
+
+# ============================================================
+# MAIN PROCESSING PIPELINE
+#
+# Wraps everything that used to run top-to-bottom in the Colab
+# notebook. Returns a dict of results for the UI to render.
+# ============================================================
+
+def process_files(transaction_file, additional_property_file, booking_file):
+
+    log_lines = []
+
+    def log(message):
+        log_lines.append(message)
+
+    # --------------------------------------------------------
+    # 1-2. READ THE ORIGINAL CSV EXACTLY AS IT APPEARS
+    #
+    # skip_blank_lines=False preserves completely blank rows.
+    # This ensures that rows 1 and 2 are removed based on their
+    # actual position in the original CSV.
+    # --------------------------------------------------------
+
+    input_filename = transaction_file.name
+
+    raw_df = read_csv_without_header(
+        transaction_file,
+        skip_blank_lines=False
+    )
+
+    log(
+        f"Original file dimensions: "
+        f"{raw_df.shape[0]} rows × "
+        f"{raw_df.shape[1]} columns"
+    )
+
+    # --------------------------------------------------------
+    # 3. VALIDATE THE ORIGINAL FILE
+    # --------------------------------------------------------
+
+    if raw_df.shape[0] < 3:
+        raise ValueError(
+            "The CSV does not contain enough rows to remove "
+            "the first two rows and create headers."
+        )
+
+    if raw_df.shape[1] < 2:
+        raise ValueError(
+            "The CSV does not contain enough columns to remove "
+            "the first column."
+        )
+
+    # --------------------------------------------------------
+    # 4. REMOVE THE ORIGINAL FIRST COLUMN
+    # --------------------------------------------------------
+
+    processed_df = raw_df.iloc[:, 1:].copy()
+
+    # --------------------------------------------------------
+    # 5. REMOVE THE ORIGINAL FIRST TWO ROWS
+    # --------------------------------------------------------
+
+    processed_df = processed_df.iloc[2:].copy()
+
+    # --------------------------------------------------------
+    # 6. MAKE THE FIRST REMAINING ROW THE HEADER ROW
+    # --------------------------------------------------------
+
+    new_headers = (
+        processed_df.iloc[0]
+        .fillna("")
+        .astype(str)
+        .map(clean_text)
+    )
+
+    processed_df = processed_df.iloc[1:].copy()
+    processed_df.columns = new_headers
+    processed_df.reset_index(drop=True, inplace=True)
+
+    # --------------------------------------------------------
+    # 7. LOCATE THE REQUIRED TRANSACTION COLUMNS
+    # --------------------------------------------------------
+
+    transaction_date_column = find_column(
+        processed_df,
+        "Transaction date"
+    )
+
+    account_name_column = find_column(
+        processed_df,
+        "Account Name"
+    )
+
+    class_full_name_column = find_column(
+        processed_df,
+        "Class full name"
+    )
+
+    description_column = find_column(
+        processed_df,
+        "Description"
+    )
+
+    num_column = find_column(
+        processed_df,
+        "Num"
+    )
+
+    # --------------------------------------------------------
+    # 8. REMOVE ROWS WHERE TRANSACTION DATE IS BLANK
+    #
+    # This removes:
+    # - Category headings
+    # - Subtotals
+    # - Totals
+    # - Other non-transaction rows
+    #
+    # The row is removed even when another field contains a
+    # label or an amount.
+    # --------------------------------------------------------
+
+    rows_before_transaction_filter = len(processed_df)
+
+    transaction_date_values = (
+        processed_df[transaction_date_column]
+        .fillna("")
+        .astype(str)
+        .map(clean_text)
+    )
+
+    processed_df = processed_df[
+        transaction_date_values.ne("")
+    ].copy()
+
+    processed_df.reset_index(drop=True, inplace=True)
+
+    rows_removed_for_blank_transaction_date = (
+        rows_before_transaction_filter
+        - len(processed_df)
+    )
+
+    # --------------------------------------------------------
+    # 9-12. READ AND COMBINE THE ADDITIONAL PROPERTY LIST
+    #
+    # The CSV should contain one property column.
+    #
+    # It may have a header such as:
+    # - Property
+    # - Properties
+    # - Property Name
+    #
+    # A header is not required.
+    # --------------------------------------------------------
+
+    additional_property_raw_df = read_csv_without_header(
+        additional_property_file,
+        skip_blank_lines=False
+    )
+
+    if additional_property_raw_df.empty:
+        raise ValueError(
+            "The uploaded additional property-list CSV is empty."
+        )
+
+    # Find columns that contain at least one nonblank value
+    nonblank_property_columns = []
+
+    for column in additional_property_raw_df.columns:
+
+        cleaned_column_values = (
+            additional_property_raw_df[column]
+            .fillna("")
+            .astype(str)
+            .map(clean_text)
+        )
+
+        if cleaned_column_values.ne("").any():
+            nonblank_property_columns.append(column)
+
+    if not nonblank_property_columns:
+        raise ValueError(
+            "No property values were found in the additional "
+            "property-list CSV."
+        )
+
+    if len(nonblank_property_columns) > 1:
+        log(
+            "Warning: The additional property CSV contains more "
+            "than one nonblank column. The first nonblank column "
+            "will be used."
+        )
+
+    additional_property_column = nonblank_property_columns[0]
+
+    additional_properties = (
+        additional_property_raw_df[additional_property_column]
+        .fillna("")
+        .astype(str)
+        .map(clean_text)
+        .tolist()
+    )
+
+    # Remove a possible header from the first row
+    possible_property_headers = {
+        "property",
+        "properties",
+        "property name",
+        "property names"
+    }
+
+    if additional_properties:
+
+        first_value_normalized = normalize_text(
+            additional_properties[0]
+        )
+
+        if first_value_normalized in possible_property_headers:
+            additional_properties = additional_properties[1:]
+
+    # Remove blanks and non-property values
+    invalid_property_values = {
+        "",
+        "fvrc",
+        "bri"
+    }
+
+    additional_properties = [
+        property_name
+        for property_name in additional_properties
+        if normalize_text(property_name)
+        not in invalid_property_values
+    ]
+
+    # Combine the base and additional property lists.
+    #
+    # Duplicate matching ignores capitalization and extra spaces.
+    # If a duplicate appears in both lists, the spelling from the
+    # base list is preserved.
+
+    combined_property_dictionary = {}
+
+    for property_name in BASE_PROPERTIES:
+
+        normalized_property = normalize_text(property_name)
+
+        if normalized_property not in invalid_property_values:
+
+            combined_property_dictionary[
+                normalized_property
+            ] = property_name
+
+    base_property_count = len(
+        combined_property_dictionary
+    )
+
+    for property_name in additional_properties:
+
+        normalized_property = normalize_text(property_name)
+
+        if (
+            normalized_property not in invalid_property_values
+            and normalized_property
+            not in combined_property_dictionary
+        ):
+
+            combined_property_dictionary[
+                normalized_property
+            ] = property_name
+
+    combined_properties = list(
+        combined_property_dictionary.values()
+    )
+
+    combined_property_count = len(
+        combined_properties
+    )
+
+    new_uploaded_property_count = (
+        combined_property_count
+        - base_property_count
+    )
+
+    # --------------------------------------------------------
+    # 13-14. READ AND VALIDATE THE BOOKING-TO-PROPERTY CSV
+    #
+    # Required columns:
+    # - Lease ID
+    # - Unit Name
+    # --------------------------------------------------------
+
+    booking_lookup_df = read_csv_with_header(
+        booking_file
+    )
+
+    lease_id_column = find_column(
+        booking_lookup_df,
+        "Lease ID"
+    )
+
+    unit_name_column = find_column(
+        booking_lookup_df,
+        "Unit Name"
+    )
+
+    booking_lookup_df[lease_id_column] = (
+        booking_lookup_df[lease_id_column]
+        .fillna("")
+        .astype(str)
+        .map(clean_text)
+    )
+
+    booking_lookup_df[unit_name_column] = (
+        booking_lookup_df[unit_name_column]
+        .fillna("")
+        .astype(str)
+        .map(clean_text)
+    )
+
+    # Remove rows with no Lease ID
+    booking_lookup_df = booking_lookup_df[
+        booking_lookup_df[lease_id_column].ne("")
+    ].copy()
+
+    booking_lookup_df.reset_index(
+        drop=True,
+        inplace=True
+    )
+
+    # --------------------------------------------------------
+    # 15. BUILD THE OFFICIAL BOOKING LOOKUP
+    #
+    # A Lease ID may appear more than once in the uploaded file.
+    #
+    # If the same Lease ID is associated with:
+    # - The same Unit Name repeatedly: it remains valid
+    # - Multiple different Unit Names: its property is
+    #   considered ambiguous and will not be guessed
+    # --------------------------------------------------------
+
+    booking_units_by_id = defaultdict(set)
+    official_booking_display = {}
+
+    for _, row in booking_lookup_df.iterrows():
+
+        lease_id = clean_text(
+            row[lease_id_column]
+        )
+
+        unit_name = clean_text(
+            row[unit_name_column]
+        )
+
+        normalized_lease_id = normalize_booking_id(
+            lease_id
+        )
+
+        if normalized_lease_id == "":
+            continue
+
+        if normalized_lease_id not in official_booking_display:
+
+            official_booking_display[
+                normalized_lease_id
+            ] = normalize_booking_id(lease_id)
+
+        if unit_name != "":
+
+            booking_units_by_id[
+                normalized_lease_id
+            ].add(unit_name)
+
+    # Official Lease ID to Property mapping
+    official_booking_to_property = {}
+
+    ambiguous_booking_ids = set()
+
+    for booking_id, unit_names in booking_units_by_id.items():
+
+        if len(unit_names) == 1:
+
+            official_booking_to_property[
+                booking_id
+            ] = next(iter(unit_names))
+
+        elif len(unit_names) > 1:
+
+            ambiguous_booking_ids.add(
+                booking_id
+            )
+
+    official_booking_ids = set(
+        official_booking_display.keys()
+    )
+
+    # --------------------------------------------------------
+    # 16. INDEX OFFICIAL BOOKINGS BY THEIR LEADING NUMBER
+    #
+    # Examples:
+    #
+    # 107988-HMYJZJXPCZ
+    # 107988
+    #
+    # Both have the leading booking number 107988.
+    #
+    # Five-digit IDs are also supported when they exist in the
+    # official booking file.
+    # --------------------------------------------------------
+
+    booking_ids_by_base_number = defaultdict(list)
+
+    for booking_id in official_booking_ids:
+
+        base_match = re.match(
+            r"^(\d{5,6})(?:-|$)",
+            booking_id
+        )
+
+        if base_match:
+
+            base_number = base_match.group(1)
+
+            booking_ids_by_base_number[
+                base_number
+            ].append(booking_id)
+
+    # Sort booking IDs to make results consistent
+    for base_number in booking_ids_by_base_number:
+
+        booking_ids_by_base_number[
+            base_number
+        ] = sorted(
+            booking_ids_by_base_number[
+                base_number
+            ]
+        )
+
+    def resolve_booking_candidate(base_number, suffix=""):
+        """
+        Resolve one possible booking reference.
+
+        Priority:
+        1. Exact official Lease ID
+        2. Unique official Lease ID starting with the prefix
+        3. Exact official base booking
+        4. Unique official Lease ID sharing the base number
+        5. Unvalidated complete booking reference
+        6. Unvalidated six-digit booking number
+
+        Returns:
+            booking_value
+            quality_score
+        """
+
+        base_number = clean_text(
+            base_number
+        )
+
+        suffix = clean_text(
+            suffix
+        ).upper()
+
+        if suffix != "":
+
+            candidate = normalize_booking_id(
+                f"{base_number}-{suffix}"
+            )
+
+        else:
+
+            candidate = normalize_booking_id(
+                base_number
+            )
+
+        # Exact official Lease ID
+        if candidate in official_booking_ids:
+
+            return (
+                official_booking_display[candidate],
+                100
+            )
+
+        official_base_candidates = (
+            booking_ids_by_base_number.get(
+                base_number,
+                []
+            )
+        )
+
+        # Unique official Lease ID beginning with an incomplete
+        # prefix such as 107938-HM3
+        if suffix != "":
+
+            prefix_matches = [
+                booking_id
+                for booking_id
+                in official_base_candidates
+                if booking_id.startswith(candidate)
+            ]
+
+            if len(prefix_matches) == 1:
+
+                resolved_booking = prefix_matches[0]
+
+                return (
+                    official_booking_display[
+                        resolved_booking
+                    ],
+                    90
+                )
+
+        # Exact official base booking such as 107964
+        normalized_base = normalize_booking_id(
+            base_number
+        )
+
+        if normalized_base in official_booking_ids:
+
+            return (
+                official_booking_display[
+                    normalized_base
+                ],
+                85
+            )
+
+        # Only one official Lease ID has this base number
+        if len(official_base_candidates) == 1:
+
+            resolved_booking = (
+                official_base_candidates[0]
+            )
+
+            return (
+                official_booking_display[
+                    resolved_booking
+                ],
+                80
+            )
+
+        # Multiple official Lease IDs share the same base
+        # number. Keep the base number but do not guess which
+        # full booking.
+        if len(official_base_candidates) > 1:
+
+            return (
+                base_number,
+                40
+            )
+
+        # Complete-looking booking not found in the uploaded
+        # file. Ten-character and longer alphanumeric suffixes
+        # are kept. This also supports examples whose suffix is
+        # longer than ten characters.
+        if suffix != "" and len(suffix) >= 10:
+
+            return (
+                candidate,
+                30
+            )
+
+        # Unmatched six-digit booking number
+        if len(base_number) == 6:
+
+            return (
+                base_number,
+                20
+            )
+
+        # Five-digit values are retained only if they were
+        # present in the official booking file.
+        if base_number in booking_ids_by_base_number:
+
+            return (
+                base_number,
+                15
+            )
+
+        return ("", -1)
+
+    def extract_best_booking_from_text(value):
+        """
+        Extract the strongest booking candidate from one text
+        field.
+        """
+
+        text = prepare_booking_source_text(
+            value
+        )
+
+        if text == "":
+            return ("", -1)
+
+        results = []
+
+        # Finds five- or six-digit leading booking numbers.
+        #
+        # Five-digit values are accepted only when supported by
+        # the official booking file.
+        booking_number_pattern = re.compile(
+            r"(?<!\d)(\d{5,6})(?!\d)"
+        )
+
+        for match in booking_number_pattern.finditer(text):
+
+            base_number = match.group(1)
+
+            text_after_number = text[
+                match.end():
+            ]
+
+            # Capture a possible alphanumeric suffix after a
+            # hyphen.
+            #
+            # Examples:
+            # -HM3
+            # -HMYJZJXPCZ
+            # -REV
+            suffix_match = re.match(
+                r"\s*-\s*([A-Z0-9]+)",
+                text_after_number
+            )
+
+            suffix = ""
+
+            if suffix_match:
+                suffix = suffix_match.group(1)
+
+            booking_value, quality_score = (
+                resolve_booking_candidate(
+                    base_number,
+                    suffix
+                )
+            )
+
+            if booking_value != "":
+
+                results.append(
+                    (
+                        booking_value,
+                        quality_score,
+                        match.start()
+                    )
+                )
+
+        if not results:
+            return ("", -1)
+
+        # Highest-quality match first.
+        # If quality is tied, use the earliest match in the
+        # text.
+        results.sort(
+            key=lambda result: (
+                -result[1],
+                result[2]
+            )
+        )
+
+        best_booking_value = results[0][0]
+        best_quality_score = results[0][1]
+
+        return (
+            best_booking_value,
+            best_quality_score
+        )
+
+    def extract_booking_from_row(row):
+        """
+        Search the three booking source fields.
+
+        Field priority:
+        1. Num
+        2. Class full name
+        3. Description
+
+        A higher-quality official match can override a weaker
+        unvalidated candidate from an earlier field.
+        """
+
+        source_columns = [
+            num_column,
+            class_full_name_column,
+            description_column
+        ]
+
+        best_booking = ""
+        best_score = -1
+
+        for source_column in source_columns:
+
+            booking_value, score = (
+                extract_best_booking_from_text(
+                    row[source_column]
+                )
+            )
+
+            if score > best_score:
+
+                best_booking = booking_value
+                best_score = score
+
+        return best_booking
+
+    def extract_property_from_description(description):
+        """
+        Search Description for a recognized property.
+
+        Returns the standardized property name from the
+        combined property list.
+
+        Returns blank if no recognized property appears.
+        """
+
+        normalized_description = normalize_text(
+            description
+        )
+
+        if normalized_description == "":
+            return ""
+
+        for property_name, property_pattern in property_patterns:
+
+            if property_pattern.search(
+                normalized_description
+            ):
+                return property_name
+
+        return ""
+
+    def get_property_from_booking(booking_value):
+        """
+        Return Unit Name for an official unambiguous Lease ID.
+
+        Otherwise return Unknown.
+        """
+
+        normalized_booking = normalize_booking_id(
+            booking_value
+        )
+
+        if normalized_booking == "":
+            return "Unknown"
+
+        if normalized_booking in ambiguous_booking_ids:
+            return "Unknown"
+
+        property_name = official_booking_to_property.get(
+            normalized_booking,
+            ""
+        )
+
+        if clean_text(property_name) == "":
+            return "Unknown"
+
+        return clean_text(property_name)
+
+    # --------------------------------------------------------
+    # 17. CREATE THE NEW OUTPUT COLUMNS
+    #
+    # Owner Name is intentionally excluded for now.
+    # --------------------------------------------------------
+
+    processed_df["Property"] = ""
+    processed_df["Booking"] = ""
+
+    # --------------------------------------------------------
+    # 18. CORPORATE ACCOUNT TAGGING
+    # --------------------------------------------------------
+
+    normalized_corporate_accounts = {
+        normalize_account_name(account_name)
+        for account_name in CORPORATE_ACCOUNT_NAMES
+    }
+
+    normalized_account_values = (
+        processed_df[account_name_column]
+        .fillna("")
+        .astype(str)
+        .map(normalize_account_name)
+    )
+
+    corporate_mask = normalized_account_values.isin(
+        normalized_corporate_accounts
+    )
+
+    processed_df.loc[
+        corporate_mask,
+        ["Property", "Booking"]
+    ] = "Corporate"
+
+    # --------------------------------------------------------
+    # 19. PROPERTY EXTRACTION STEP 1:
+    #     PROPERTY FROM CLASS FULL NAME
+    #
+    # This runs only for non-Corporate rows.
+    #
+    # Rules:
+    # - Blank = do not use
+    # - FVRC = do not use
+    # - BRI = do not use
+    # - Every other nonblank Class full name = Property
+    # --------------------------------------------------------
+
+    class_values = (
+        processed_df[class_full_name_column]
+        .fillna("")
+        .astype(str)
+        .map(clean_text)
+    )
+
+    normalized_class_values = (
+        class_values.map(normalize_text)
+    )
+
+    invalid_class_values = {
+        "",
+        "fvrc",
+        "bri"
+    }
+
+    valid_class_property_mask = (
+        ~corporate_mask
+        & ~normalized_class_values.isin(
+            invalid_class_values
+        )
+    )
+
+    processed_df.loc[
+        valid_class_property_mask,
+        "Property"
+    ] = class_values[
+        valid_class_property_mask
+    ]
+
+    # --------------------------------------------------------
+    # 20. BUILD PROPERTY-MATCHING PATTERNS FOR DESCRIPTION
+    #
+    # Matching:
+    # - Ignores capitalization
+    # - Ignores repeated spaces
+    # - Prefers longer and more specific properties
+    # - Recognizes formats such as TT3 and TT 3
+    # - Does not guess when no valid property is found
+    # --------------------------------------------------------
+
+    # Longer property names are checked first
+    sorted_properties_for_matching = sorted(
+        combined_properties,
+        key=lambda property_name: (
+            len(normalize_text(property_name)),
+            len(
+                normalize_text(property_name).split()
+            )
+        ),
+        reverse=True
+    )
+
+    property_patterns = [
+        (
+            property_name,
+            build_property_regex(property_name)
+        )
+        for property_name
+        in sorted_properties_for_matching
+    ]
+
+    # --------------------------------------------------------
+    # 21. PROPERTY EXTRACTION STEP 2:
+    #     PROPERTY FROM DESCRIPTION
+    #
+    # This runs only when:
+    # - The row is not Corporate
+    # - Property is still blank
+    # --------------------------------------------------------
+
+    property_blank_before_description = (
+        processed_df["Property"]
+        .fillna("")
+        .astype(str)
+        .map(clean_text)
+        .eq("")
+    )
+
+    description_property_candidate_mask = (
+        ~corporate_mask
+        & property_blank_before_description
+    )
+
+    description_property_matches = (
+        processed_df.loc[
+            description_property_candidate_mask,
+            description_column
+        ]
+        .fillna("")
+        .astype(str)
+        .map(extract_property_from_description)
+    )
+
+    processed_df.loc[
+        description_property_candidate_mask,
+        "Property"
+    ] = description_property_matches
+
+    # --------------------------------------------------------
+    # 22-23. EXTRACT BOOKING FOR STILL-UNRESOLVED ROWS
+    #
+    # This runs only when:
+    # - The row is not Corporate
+    # - Property remains blank after Class and Description
+    #   mapping
+    #
+    # Booking references may appear in:
+    #
+    # 1. Num
+    # 2. Class full name
+    # 3. Description
+    #
+    # Examples:
+    #
+    # 107669 CM
+    # 103938RR
+    # Invoice 107874-HM5 RR
+    # 103548-Rev-2026-02-28
+    # 107938-HM3-2026-01-31
+    # 107988-HMYJZJXPCZ
+    # 107980-HM5B4P9JCM
+    #
+    # The booking lookup file is used as the source of truth.
+    # --------------------------------------------------------
+
+    property_blank_before_booking = (
+        processed_df["Property"]
+        .fillna("")
+        .astype(str)
+        .map(clean_text)
+        .eq("")
+    )
+
+    booking_candidate_mask = (
+        ~corporate_mask
+        & property_blank_before_booking
+    )
+
+    processed_df.loc[
+        booking_candidate_mask,
+        "Booking"
+    ] = processed_df.loc[
+        booking_candidate_mask
+    ].apply(
+        extract_booking_from_row,
+        axis=1
+    )
+
+    # --------------------------------------------------------
+    # 24. POPULATE PROPERTY FROM THE CONFIRMED BOOKING
+    #
+    # Exact or uniquely resolved official bookings use Unit
+    # Name.
+    #
+    # If the booking cannot be mapped to one Unit Name:
+    # Property = Unknown
+    #
+    # If no booking can be extracted:
+    # Property = Unknown
+    # --------------------------------------------------------
+
+    processed_df.loc[
+        booking_candidate_mask,
+        "Property"
+    ] = processed_df.loc[
+        booking_candidate_mask,
+        "Booking"
+    ].map(
+        get_property_from_booking
+    )
+
+    # --------------------------------------------------------
+    # 25. FINAL SAFETY CHECK
+    #
+    # Any non-Corporate row that somehow still has a blank
+    # Property is labeled Unknown.
+    # --------------------------------------------------------
+
+    final_blank_property_mask = (
+        ~corporate_mask
+        & processed_df["Property"]
+            .fillna("")
+            .astype(str)
+            .map(clean_text)
+            .eq("")
+    )
+
+    processed_df.loc[
+        final_blank_property_mask,
+        "Property"
+    ] = "Unknown"
+
+    # --------------------------------------------------------
+    # 26. SUMMARY STATISTICS
+    # --------------------------------------------------------
+
+    corporate_row_count = int(
+        corporate_mask.sum()
+    )
+
+    property_from_class_count = int(
+        valid_class_property_mask.sum()
+    )
+
+    property_from_description_count = int(
+        description_property_matches
+        .fillna("")
+        .astype(str)
+        .map(clean_text)
+        .ne("")
+        .sum()
+    )
+
+    booking_extracted_count = int(
+        (
+            booking_candidate_mask
+            & processed_df["Booking"]
+                .fillna("")
+                .astype(str)
+                .map(clean_text)
+                .ne("")
+        ).sum()
+    )
+
+    property_from_booking_count = int(
+        (
+            booking_candidate_mask
+            & ~processed_df["Property"].eq("Unknown")
+        ).sum()
+    )
+
+    unknown_property_count = int(
+        processed_df["Property"]
+        .eq("Unknown")
+        .sum()
+    )
+
+    ambiguous_booking_count = len(
+        ambiguous_booking_ids
+    )
+
+    stats = {
+        "Original file dimensions": (
+            f"{raw_df.shape[0]} rows × {raw_df.shape[1]} columns"
+        ),
+        "Final file dimensions": (
+            f"{processed_df.shape[0]} rows × "
+            f"{processed_df.shape[1]} columns"
+        ),
+        "Rows removed (blank Transaction date)": (
+            rows_removed_for_blank_transaction_date
+        ),
+        "Base valid properties": base_property_count,
+        "New unique properties from uploaded list": (
+            new_uploaded_property_count
+        ),
+        "Total combined valid properties": (
+            combined_property_count
+        ),
+        "Official Lease IDs loaded": len(official_booking_ids),
+        "Lease IDs with conflicting Unit Names": (
+            ambiguous_booking_count
+        ),
+        "Corporate rows": corporate_row_count,
+        "Properties populated from Class full name": (
+            property_from_class_count
+        ),
+        "Properties populated from Description": (
+            property_from_description_count
+        ),
+        "Bookings extracted for unresolved rows": (
+            booking_extracted_count
+        ),
+        "Properties populated from Booking": (
+            property_from_booking_count
+        ),
+        "Rows tagged as Unknown Property": (
+            unknown_property_count
+        ),
+    }
+
+    # --------------------------------------------------------
+    # UNKNOWN PROPERTY ROWS FOR REVIEW
+    # --------------------------------------------------------
+
+    mapping_preview_columns = [
+        transaction_date_column,
+        account_name_column,
+        num_column,
+        class_full_name_column,
+        description_column,
+        "Property",
+        "Booking"
+    ]
+
+    unknown_review_df = processed_df[
+        processed_df["Property"].eq("Unknown")
+    ][mapping_preview_columns].copy()
+
+    # --------------------------------------------------------
+    # COMBINED PROPERTY-LIST OUTPUT
+    # --------------------------------------------------------
+
+    combined_property_df = pd.DataFrame({
+        "Property": combined_properties
+    })
+
+    # --------------------------------------------------------
+    # OUTPUT FILE NAMES
+    # --------------------------------------------------------
+
+    input_name_without_extension = os.path.splitext(
+        input_filename
+    )[0]
+
+    output_filename = (
+        f"{input_name_without_extension}_mapped.csv"
+    )
+
+    property_list_output_filename = (
+        f"{input_name_without_extension}"
+        f"_combined_property_list.csv"
+    )
+
+    unknown_output_filename = (
+        f"{input_name_without_extension}"
+        f"_unknown_property_review.csv"
+    )
+
+    return {
+        "log_lines": log_lines,
+        "stats": stats,
+        "processed_df": processed_df,
+        "mapping_preview_columns": mapping_preview_columns,
+        "unknown_review_df": unknown_review_df,
+        "combined_property_df": combined_property_df,
+        "output_filename": output_filename,
+        "property_list_output_filename": (
+            property_list_output_filename
+        ),
+        "unknown_output_filename": unknown_output_filename,
+    }
+
+
+# ============================================================
+# STREAMLIT PAGE
+# ============================================================
+
+st.set_page_config(
+    page_title="SOS P&L Draft",
+    layout="wide"
+)
+
+st.title("FVRC P&L Detail Cleaning and Property / Booking Mapping")
+
+st.markdown(
+    "Upload the three required files below, then click "
+    "**Run processing**."
+)
+
+transaction_file = st.file_uploader(
+    "1. Original FVRC Profit and Loss Detail CSV",
+    type="csv",
+    key="transaction_file"
+)
+
+property_file = st.file_uploader(
+    "2. Additional one-column property-list CSV",
+    type="csv",
+    key="property_file"
+)
+
+booking_file = st.file_uploader(
+    "3. Booking-to-property CSV (must contain 'Lease ID' and "
+    "'Unit Name')",
+    type="csv",
+    key="booking_file"
+)
+
+all_files_uploaded = bool(
+    transaction_file and property_file and booking_file
+)
+
+run_clicked = st.button(
+    "Run processing",
+    disabled=not all_files_uploaded
+)
+
+if run_clicked:
+
+    with st.spinner("Processing..."):
+
+        try:
+            results = process_files(
+                transaction_file,
+                property_file,
+                booking_file
+            )
+            st.session_state["sos_results"] = results
+
+        except (ValueError, KeyError) as error:
+            st.session_state.pop("sos_results", None)
+            st.error(str(error))
+
+if "sos_results" in st.session_state:
+
+    results = st.session_state["sos_results"]
+
+    st.success("Processing completed.")
+
+    for log_line in results["log_lines"]:
+        st.write(log_line)
+
+    st.subheader("Processing summary")
+
+    stats_df = pd.DataFrame(
+        results["stats"].items(),
+        columns=["Metric", "Value"]
+    )
+
+    st.table(stats_df)
+
+    st.subheader("Preview of the processed data")
+    st.dataframe(results["processed_df"].head(20))
+
+    st.subheader("Preview of the mapping fields")
+    st.dataframe(
+        results["processed_df"][
+            results["mapping_preview_columns"]
+        ].head(50)
+    )
+
+    st.subheader(
+        f"Unknown Property rows "
+        f"({len(results['unknown_review_df'])} total)"
+    )
+    st.dataframe(results["unknown_review_df"].head(50))
+
+    st.subheader("Downloads")
+
+    col1, col2, col3 = st.columns(3)
+
+    with col1:
+        st.download_button(
+            "Download processed CSV",
+            data=results["processed_df"].to_csv(
+                index=False
+            ).encode("utf-8-sig"),
+            file_name=results["output_filename"],
+            mime="text/csv"
+        )
+
+    with col2:
+        st.download_button(
+            "Download combined property list",
+            data=results["combined_property_df"].to_csv(
+                index=False
+            ).encode("utf-8-sig"),
+            file_name=results["property_list_output_filename"],
+            mime="text/csv"
+        )
+
+    with col3:
+        st.download_button(
+            "Download unknown-property review",
+            data=results["unknown_review_df"].to_csv(
+                index=False
+            ).encode("utf-8-sig"),
+            file_name=results["unknown_output_filename"],
+            mime="text/csv"
+        )
