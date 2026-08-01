@@ -75,6 +75,37 @@ def normalize_account_name(value):
     return text
 
 
+def parse_amount(value):
+    """
+    Parse a currency-formatted Amount value into a float.
+
+    Handles a leading "$", thousands-separator commas, and both
+    "-123.45" and parenthesized "(123.45)" negative formats.
+
+    Returns None if the value is blank or cannot be parsed.
+    """
+
+    text = clean_text(value)
+
+    if text == "":
+        return None
+
+    negative = (
+        text.startswith("-")
+        or (text.startswith("(") and text.endswith(")"))
+    )
+
+    text = text.strip("()")
+    text = text.replace("$", "").replace(",", "").replace("-", "")
+
+    try:
+        amount = float(text)
+    except ValueError:
+        return None
+
+    return -amount if negative else amount
+
+
 def normalize_booking_id(value):
     """
     Normalize booking IDs for matching.
@@ -352,6 +383,372 @@ CORPORATE_ACCOUNT_NAMES = [
 ]
 
 
+# ============================================================
+# STEP 2: ACCOUNT SPLIT RULES
+#
+# Some accounts mix income and cost in a single account. Each
+# rule below assigns matching rows a "Classification" of either
+# the rule's income_label or cost_label (or blank, if excluded /
+# flagged for review) and records a sign-corrected value in
+# "Adjusted Amount".
+#
+# Nothing is overwritten in place — "Account", "Transaction
+# Type", "Name", "Amount", "Description", and every other
+# original column always keep their original values.
+# "Classification" and "Adjusted Amount" are the two new columns
+# added by Step 2.
+#
+# The account is matched by comparing the normalized "Account
+# Name" field (blank-safe, trimmed, case-insensitive — see
+# normalize_account_name()) against "source_account" exactly.
+#
+# rule_type == "name_based":
+#   Classification comes from the "Name" column.
+#   - Name matches one of "cost_name_values"  -> Cost
+#   - Name is nonblank and does not match      -> Income
+#   - Name is blank                            -> the user is
+#     asked to tag the row as Income or Cost
+#
+# rule_type == "transaction_type_based":
+#   Classification comes from the single centralized
+#   classify_by_transaction_type() function below, driven by
+#   each rule's "transaction_type_map" (and, optionally,
+#   "sign_based_types" for accounts where a specific Transaction
+#   Type is decided by the Amount sign instead of a fixed
+#   lookup — see Housekeeping Clearing). Amount sign is NOT used
+#   unless a type is explicitly listed in "sign_based_types".
+#   Transaction Types not covered by the rule are left
+#   unclassified and flagged for review — nothing is asked of
+#   the user.
+#
+# To add another account: add a new rule entry (and, for
+# transaction_type_based rules, a new *_TRANSACTION_TYPE_MAP
+# dict below). Do not write a new classification function.
+# ============================================================
+
+HOUSEKEEPING_TRANSACTION_TYPE_MAP = {
+    "bill": "Cost",
+    "credit memo": "Income",
+    "deposit": "Cost",
+    "refund": "Income",
+    "revenue recognition": "Income",
+    "vendor credit": "Income",
+}
+
+# OTA / booking-channel commission account. Unrelated to
+# property-management commissions — those are not covered by
+# this rule.
+OTA_COMMISSION_TRANSACTION_TYPE_MAP = {
+    "revenue recognition": "Income",
+    "refund": "Income",
+    "credit memo": "Income",
+    "expense": "Cost",
+}
+
+HOA_TRANSACTION_TYPE_MAP = {
+    "bill": "Cost",
+    "credit memo": "Income",
+    "refund": "Income",
+    "revenue recognition": "Income",
+    "vendor credit": "Income",
+}
+
+TRAVEL_INSURANCE_TRANSACTION_TYPE_MAP = {
+    "bill": "Cost",
+    "refund": "Income",
+    "revenue recognition": "Income",
+}
+
+CAM_TRANSACTION_TYPE_MAP = {
+    "credit memo": "Income",
+    "refund": "Income",
+    "revenue recognition": "Income",
+    "expense": "Cost",
+}
+
+# Bill -> Income and Vendor Credit -> Income are PROVISIONAL,
+# pending bookkeeper confirmation — everywhere else in this
+# file, Bill and Vendor Credit map to Cost/Income respectively
+# for the *other* Pass Thru accounts, so double-check before
+# reusing this table as a template.
+LOCK_FEE_TRANSACTION_TYPE_MAP = {
+    "revenue recognition": "Income",
+    "refund": "Income",
+    "credit memo": "Income",
+    "bill": "Income",
+    "vendor credit": "Income",
+    "expense": "Cost",
+}
+
+APP_FEE_TRANSACTION_TYPE_MAP = {
+    "revenue recognition": "Income",
+    "credit memo": "Income",
+    "expense": "Cost",
+}
+
+ACCOUNT_SPLIT_RULES = [
+    {
+        "source_account": "Pass Thru Income:Credit Card Clearing",
+        "income_label": "Credit Card Income",
+        "cost_label": "Credit Card Cost",
+        "rule_type": "name_based",
+        "cost_name_values": {"Lynnbrook Merchant Services"},
+        "allow_manual_tagging": True,
+    },
+    {
+        "source_account": (
+            "Pass Thru Income:Housekeeping Clearing"
+        ),
+        "income_label": "Housekeeping Income",
+        "cost_label": "Housekeeping Cost",
+        "rule_type": "transaction_type_based",
+        "allow_manual_tagging": False,
+        "transaction_type_map": HOUSEKEEPING_TRANSACTION_TYPE_MAP,
+        # "Journal Entry" is decided by the Amount sign instead
+        # of the map above: negative -> Cost, zero or positive
+        # -> Income. Zero is not a special case.
+        "sign_based_types": {"journal entry"},
+    },
+    {
+        "source_account": "Pass Thru Income:Commission",
+        "income_label": "OTA Commission Income",
+        "cost_label": "OTA Commission Cost",
+        "rule_type": "transaction_type_based",
+        "allow_manual_tagging": False,
+        "transaction_type_map": (
+            OTA_COMMISSION_TRANSACTION_TYPE_MAP
+        ),
+        # Amount sign is never used for this account — Refunds
+        # and Credit Memos stay Income even when negative.
+        "sign_based_types": set(),
+    },
+    {
+        "source_account": "Pass Thru Income:HOA Clearing",
+        "income_label": "HOA Income",
+        "cost_label": "HOA Cost",
+        "rule_type": "transaction_type_based",
+        "allow_manual_tagging": False,
+        "transaction_type_map": HOA_TRANSACTION_TYPE_MAP,
+        # Amount sign is never used for this account — negative
+        # Credit Memos/Refunds stay Income, and zero-value Bills
+        # still classify as Cost like any other Bill.
+        "sign_based_types": set(),
+    },
+    {
+        "source_account": (
+            "Pass Thru Income:Travel Ins Fee Clearing"
+        ),
+        "income_label": "Travel Insurance Income",
+        "cost_label": "Travel Insurance Cost",
+        "rule_type": "transaction_type_based",
+        "allow_manual_tagging": False,
+        "transaction_type_map": (
+            TRAVEL_INSURANCE_TRANSACTION_TYPE_MAP
+        ),
+        # Amount sign is never used for this account — a
+        # negative Refund stays Income, and a zero-value Bill
+        # still classifies as Cost like any other Bill.
+        "sign_based_types": set(),
+    },
+    {
+        "source_account": "Pass Thru Income:CAM Clearing",
+        "income_label": "CAM Income",
+        "cost_label": "CAM Cost",
+        "rule_type": "transaction_type_based",
+        "allow_manual_tagging": False,
+        "transaction_type_map": CAM_TRANSACTION_TYPE_MAP,
+        # Amount sign is never used for this account — negative
+        # Credit Memos/Refunds stay Income, and a zero-value
+        # Expense would still classify as Cost like any other
+        # Expense.
+        "sign_based_types": set(),
+    },
+    {
+        "source_account": "Pass Thru Income:Lock Fee Clearing",
+        "income_label": "Lock Fee Income",
+        "cost_label": "Lock Fee Cost",
+        "rule_type": "transaction_type_based",
+        "allow_manual_tagging": False,
+        "transaction_type_map": LOCK_FEE_TRANSACTION_TYPE_MAP,
+        # Amount sign is never used for this account — negative
+        # Refunds/Credit Memos stay Income, and a zero-value row
+        # still classifies by its Transaction Type. Bill and
+        # Vendor Credit -> Income are provisional — see the map
+        # definition above.
+        "sign_based_types": set(),
+    },
+    {
+        "source_account": "Pass Thru Income:App Fee",
+        "income_label": "App Fee Income",
+        "cost_label": "App Fee Cost",
+        "rule_type": "transaction_type_based",
+        "allow_manual_tagging": False,
+        "transaction_type_map": APP_FEE_TRANSACTION_TYPE_MAP,
+        # Amount sign is never used for this account — a
+        # negative Credit Memo stays Income, and a zero-value
+        # row still classifies by its Transaction Type.
+        "sign_based_types": set(),
+    },
+]
+
+
+def classify_by_transaction_type(rule, transaction_type, amount):
+    """
+    Centralized classification for every rule_type ==
+    "transaction_type_based" account (see ACCOUNT_SPLIT_RULES).
+
+    - If the (normalized) Transaction Type is listed in the
+      rule's "sign_based_types", classify by the Amount sign:
+      negative -> Cost, zero or positive -> Income.
+    - Otherwise, look the Transaction Type up in the rule's
+      "transaction_type_map".
+    - If it isn't found either way, return "" — unclassified,
+      flagged for review.
+
+    Add a new account by adding a rule + a transaction type map,
+    not by writing a new function.
+    """
+
+    normalized_type = normalize_text(transaction_type)
+
+    if normalized_type in rule.get("sign_based_types", set()):
+
+        if amount is None:
+            return ""
+
+        return "Cost" if amount < 0 else "Income"
+
+    return rule["transaction_type_map"].get(
+        normalized_type,
+        ""
+    )
+
+
+def get_account_match_mask(df, account_name_col, source_account):
+    """
+    Boolean mask of rows whose Account Name matches
+    source_account exactly (blank-safe, trimmed,
+    case-insensitive).
+    """
+
+    normalized_target = normalize_account_name(source_account)
+
+    return (
+        df[account_name_col]
+        .map(normalize_account_name)
+        .eq(normalized_target)
+    )
+
+
+def classify_row_for_rule(
+    row, rule, name_col, transaction_type_col, amount_col
+):
+    """
+    Classify a single row for one rule. Centralized dispatch by
+    rule_type — the only place row-level classification logic
+    lives, for both the auto-applied rules and the one rule that
+    needs manual review (Credit Card Clearing).
+
+    Returns "Income", "Cost", or "" (unclassified / flagged for
+    review).
+    """
+
+    if rule["rule_type"] == "name_based":
+
+        name_value = clean_text(row[name_col])
+
+        if name_value == "":
+            return ""
+
+        cost_values = {
+            normalize_text(value)
+            for value in rule["cost_name_values"]
+        }
+
+        if normalize_text(name_value) in cost_values:
+            return "Cost"
+
+        return "Income"
+
+    if rule["rule_type"] == "transaction_type_based":
+
+        amount = parse_amount(row[amount_col])
+
+        return classify_by_transaction_type(
+            rule,
+            row[transaction_type_col],
+            amount
+        )
+
+    return ""
+
+
+def apply_rule_classification(
+    df, rule, matched_index, final_classification, amount_col
+):
+    """
+    Write "Classification" and "Adjusted Amount" for one rule's
+    matched rows into df, IN PLACE. Never touches the original
+    "Account Name" / "Amount" columns.
+
+    A Cost row whose Amount can't be parsed is left unclassified
+    instead of blocking the rest of the rows.
+
+    Returns (parseable_cost_index, income_index,
+    unparseable_cost_index).
+    """
+
+    income_label = rule["income_label"]
+    cost_label = rule["cost_label"]
+
+    final_classification = final_classification.copy()
+
+    cost_index = final_classification[
+        final_classification.eq("Cost")
+    ].index
+
+    income_index = final_classification[
+        final_classification.eq("Income")
+    ].index
+
+    parsed_amounts = df.loc[cost_index, amount_col].map(
+        parse_amount
+    )
+
+    unparseable_cost_index = parsed_amounts[
+        parsed_amounts.isna()
+    ].index
+
+    parseable_cost_index = parsed_amounts[
+        parsed_amounts.notna()
+    ].index
+
+    final_classification.loc[unparseable_cost_index] = ""
+
+    df.loc[matched_index, "Classification"] = (
+        final_classification.map(
+            lambda value: (
+                cost_label if value == "Cost"
+                else (
+                    income_label if value == "Income" else ""
+                )
+            )
+        )
+    )
+
+    df.loc[parseable_cost_index, "Adjusted Amount"] = (
+        parsed_amounts.loc[parseable_cost_index].map(
+            lambda value: f"{-value:.2f}"
+        )
+    )
+
+    df.loc[income_index, "Adjusted Amount"] = (
+        df.loc[income_index, amount_col]
+    )
+
+    return parseable_cost_index, income_index, unparseable_cost_index
+
+
 def build_property_regex(property_name):
     """
     Create a conservative property matching pattern.
@@ -529,6 +926,11 @@ def process_files(transaction_file, additional_property_file, booking_file):
         "Num"
     )
 
+    amount_column = find_column(
+        processed_df,
+        "Amount"
+    )
+
     # --------------------------------------------------------
     # 8. REMOVE ROWS WHERE TRANSACTION DATE IS BLANK
     #
@@ -560,6 +962,47 @@ def process_files(transaction_file, additional_property_file, booking_file):
     rows_removed_for_blank_transaction_date = (
         rows_before_transaction_filter
         - len(processed_df)
+    )
+
+    # --------------------------------------------------------
+    # 8b. NORMALIZE THE AMOUNT COLUMN
+    #
+    # Every Amount value is rewritten as a plain number with two
+    # decimals — no "$", no thousands commas. Blank values stay
+    # blank. Values that cannot be parsed as a number are left
+    # untouched and counted below.
+    # --------------------------------------------------------
+
+    def format_amount(value):
+
+        text = clean_text(value)
+
+        if text == "":
+            return ""
+
+        parsed = parse_amount(text)
+
+        if parsed is None:
+            return text
+
+        return f"{parsed:.2f}"
+
+    original_amount_values = (
+        processed_df[amount_column]
+        .fillna("")
+        .astype(str)
+        .map(clean_text)
+    )
+
+    unparseable_amount_count = int(
+        (
+            original_amount_values.ne("")
+            & original_amount_values.map(parse_amount).isna()
+        ).sum()
+    )
+
+    processed_df[amount_column] = (
+        processed_df[amount_column].map(format_amount)
     )
 
     # --------------------------------------------------------
@@ -1503,6 +1946,9 @@ def process_files(transaction_file, additional_property_file, booking_file):
         "Rows tagged as Unknown Property": (
             unknown_property_count
         ),
+        "Amount values that could not be normalized": (
+            unparseable_amount_count
+        ),
     }
 
     # --------------------------------------------------------
@@ -1565,6 +2011,12 @@ def process_files(transaction_file, additional_property_file, booking_file):
             property_list_output_filename
         ),
         "unknown_output_filename": unknown_output_filename,
+        "transaction_date_column": transaction_date_column,
+        "account_name_column": account_name_column,
+        "class_full_name_column": class_full_name_column,
+        "description_column": description_column,
+        "num_column": num_column,
+        "amount_column": amount_column,
     }
 
 
@@ -1573,48 +2025,215 @@ def process_files(transaction_file, additional_property_file, booking_file):
 # ============================================================
 
 st.set_page_config(
-    page_title="SOS P&L Draft",
-    layout="wide"
+    page_title="SOS P&L Data Prep",
+    page_icon="🏢",
+    layout="wide",
+    initial_sidebar_state="expanded"
 )
 
-st.title("FVRC P&L Detail Cleaning and Property / Booking Mapping")
+CUSTOM_CSS = """
+<style>
+.block-container {
+    padding-top: 2.5rem;
+    padding-bottom: 4rem;
+    max-width: 1150px;
+}
+
+/* Hero */
+.hps-hero h1 {
+    font-size: 2.05rem;
+    font-weight: 750;
+    margin-bottom: 0.1rem;
+    letter-spacing: -0.02em;
+}
+.hps-hero p {
+    font-size: 1.02rem;
+    opacity: 0.72;
+    margin-top: 0;
+    margin-bottom: 1.6rem;
+}
+
+/* Upload cards */
+div[data-testid="stVerticalBlockBorderWrapper"] {
+    border-radius: 14px !important;
+}
+div[data-testid="stFileUploaderDropzone"] {
+    border-radius: 10px;
+}
+
+.status-pill {
+    display: inline-block;
+    padding: 0.18rem 0.65rem;
+    border-radius: 999px;
+    font-size: 0.75rem;
+    font-weight: 600;
+    margin-top: 0.35rem;
+}
+.status-pending {
+    background: rgba(128, 128, 128, 0.15);
+    opacity: 0.75;
+}
+.status-done {
+    background: rgba(16, 185, 129, 0.16);
+    color: #10b981;
+}
+
+/* Primary run button */
+div[data-testid="stButton"] button[kind="primary"] {
+    border-radius: 999px;
+    padding: 0.55rem 2.2rem;
+    font-weight: 650;
+    font-size: 1.02rem;
+    box-shadow: 0 4px 14px rgba(0, 0, 0, 0.12);
+}
+
+/* Download buttons */
+div[data-testid="stDownloadButton"] button {
+    border-radius: 10px;
+    font-weight: 600;
+    width: 100%;
+}
+
+/* Dataframes */
+div[data-testid="stDataFrame"] {
+    border-radius: 12px;
+    overflow: hidden;
+}
+
+/* Metrics */
+div[data-testid="stMetric"] {
+    background: rgba(128, 128, 128, 0.06);
+    border-radius: 12px;
+    padding: 0.9rem 1rem 0.6rem 1rem;
+}
+
+hr {
+    margin: 1.6rem 0;
+}
+</style>
+"""
+
+st.markdown(CUSTOM_CSS, unsafe_allow_html=True)
+
+if "uploader_version" not in st.session_state:
+    st.session_state["uploader_version"] = 0
+
+uploader_version = st.session_state["uploader_version"]
+
+with st.sidebar:
+    st.markdown("### 🏢 SOS P&L Data Prep")
+    st.caption(
+        "FVRC transaction cleaning & property/booking mapping"
+    )
+    st.divider()
+    st.markdown(
+        "**How it works**\n\n"
+        "1. Upload the three CSVs\n"
+        "2. Click **Run processing**\n"
+        "3. Review results and download"
+    )
+    st.divider()
+    st.caption(
+        "Everything runs locally in this session — no data is "
+        "stored or sent anywhere else."
+    )
 
 st.markdown(
-    "Upload the three required files below, then click "
-    "**Run processing**."
+    '<div class="hps-hero">'
+    '<h1>SOS - Property-Level P&amp;L Data Preparation Tool</h1>'
+    '<p>Clean the transaction export and map every row to a '
+    'Property and Booking.</p>'
+    '</div>',
+    unsafe_allow_html=True
 )
 
-transaction_file = st.file_uploader(
-    "1. Original FVRC Profit and Loss Detail CSV",
-    type="csv",
-    key="transaction_file"
-)
+file_specs = [
+    (
+        "📄",
+        "Transaction CSV",
+        "Original FVRC Profit and Loss Detail export",
+        f"transaction_file_{uploader_version}"
+    ),
+    (
+        "🏘️",
+        "Property list",
+        "Additional one-column property list",
+        f"property_file_{uploader_version}"
+    ),
+    (
+        "🔗",
+        "Booking lookup",
+        "CSV with 'Lease ID' and 'Unit Name'",
+        f"booking_file_{uploader_version}"
+    ),
+]
 
-property_file = st.file_uploader(
-    "2. Additional one-column property-list CSV",
-    type="csv",
-    key="property_file"
-)
+upload_cols = st.columns(3)
+uploaded_files = {}
 
-booking_file = st.file_uploader(
-    "3. Booking-to-property CSV (must contain 'Lease ID' and "
-    "'Unit Name')",
-    type="csv",
-    key="booking_file"
-)
+for col, (icon, title, help_text, widget_key) in zip(
+    upload_cols, file_specs
+):
+    with col:
+        with st.container(border=True):
+            st.markdown(f"**{icon} {title}**")
+            uploaded_file = st.file_uploader(
+                title,
+                type="csv",
+                key=widget_key,
+                help=help_text,
+                label_visibility="collapsed"
+            )
+
+            if uploaded_file:
+                st.markdown(
+                    '<span class="status-pill status-done">'
+                    '✓ Uploaded</span>',
+                    unsafe_allow_html=True
+                )
+            else:
+                st.markdown(
+                    '<span class="status-pill status-pending">'
+                    'Pending</span>',
+                    unsafe_allow_html=True
+                )
+
+            uploaded_files[widget_key] = uploaded_file
+
+transaction_file = uploaded_files[
+    f"transaction_file_{uploader_version}"
+]
+property_file = uploaded_files[
+    f"property_file_{uploader_version}"
+]
+booking_file = uploaded_files[
+    f"booking_file_{uploader_version}"
+]
 
 all_files_uploaded = bool(
     transaction_file and property_file and booking_file
 )
 
-run_clicked = st.button(
-    "Run processing",
-    disabled=not all_files_uploaded
-)
+st.write("")
+
+_, run_col, _ = st.columns([1, 1.2, 1])
+
+with run_col:
+    run_clicked = st.button(
+        "▶  Run processing",
+        type="primary",
+        use_container_width=True,
+        disabled=not all_files_uploaded
+    )
+
+if not all_files_uploaded:
+    st.caption(
+        "Upload all three files above to enable processing."
+    )
 
 if run_clicked:
 
-    with st.spinner("Processing..."):
+    with st.spinner("Processing transactions..."):
 
         try:
             results = process_files(
@@ -1624,6 +2243,16 @@ if run_clicked:
             )
             st.session_state["sos_results"] = results
 
+            # A fresh Step 1 result invalidates any in-progress
+            # Step 2 work (it was built from the previous
+            # dataframe) — clear it so Step 2 can't silently
+            # keep operating on stale data.
+            for key in list(st.session_state.keys()):
+                if key == "stage2_df" or key.startswith(
+                    "stage2_"
+                ):
+                    del st.session_state[key]
+
         except (ValueError, KeyError) as error:
             st.session_state.pop("sos_results", None)
             st.error(str(error))
@@ -1631,67 +2260,508 @@ if run_clicked:
 if "sos_results" in st.session_state:
 
     results = st.session_state["sos_results"]
+    stats = results["stats"]
 
-    st.success("Processing completed.")
+    st.divider()
 
-    for log_line in results["log_lines"]:
-        st.write(log_line)
+    header_col, reset_col = st.columns([5, 1])
 
-    st.subheader("Processing summary")
+    with header_col:
+        st.subheader("✅ Processing completed")
 
-    stats_df = pd.DataFrame(
-        results["stats"].items(),
-        columns=["Metric", "Value"]
+    with reset_col:
+        if st.button("🔄 Start over", use_container_width=True):
+            for key in list(st.session_state.keys()):
+                if key == "sos_results" or key.startswith(
+                    "stage2_"
+                ):
+                    del st.session_state[key]
+            st.session_state["uploader_version"] += 1
+            st.rerun()
+
+    total_rows = len(results["processed_df"])
+    unknown_rows = stats["Rows tagged as Unknown Property"]
+    match_rate = (
+        100.0 * (total_rows - unknown_rows) / total_rows
+        if total_rows else 0.0
     )
 
-    st.table(stats_df)
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Rows processed", f"{total_rows:,}")
+    m2.metric("Corporate rows", f"{stats['Corporate rows']:,}")
+    m3.metric("Unknown property rows", f"{unknown_rows:,}")
+    m4.metric("Match rate", f"{match_rate:.1f}%")
 
-    st.subheader("Preview of the processed data")
-    st.dataframe(results["processed_df"].head(20))
+    (
+        tab_summary,
+        tab_data,
+        tab_mapping,
+        tab_unknown,
+        tab_downloads
+    ) = st.tabs(
+        [
+            "📊 Summary",
+            "🧾 Processed Data",
+            "🗺️ Mapping Preview",
+            "❓ Unknown Rows",
+            "⬇️ Downloads"
+        ]
+    )
 
-    st.subheader("Preview of the mapping fields")
+    with tab_summary:
+
+        for log_line in results["log_lines"]:
+            st.write(log_line)
+
+        stats_df = pd.DataFrame(
+            stats.items(),
+            columns=["Metric", "Value"]
+        )
+        st.dataframe(
+            stats_df,
+            use_container_width=True,
+            hide_index=True
+        )
+
+    with tab_data:
+        st.dataframe(
+            results["processed_df"],
+            use_container_width=True,
+            height=440
+        )
+
+    with tab_mapping:
+        st.dataframe(
+            results["processed_df"][
+                results["mapping_preview_columns"]
+            ],
+            use_container_width=True,
+            height=440
+        )
+
+    with tab_unknown:
+        if unknown_rows:
+            st.warning(
+                f"{unknown_rows} row(s) could not be matched "
+                "to a known property. Review below."
+            )
+        else:
+            st.success("No unresolved rows.")
+
+        st.dataframe(
+            results["unknown_review_df"],
+            use_container_width=True,
+            height=440
+        )
+
+    with tab_downloads:
+
+        d1, d2, d3 = st.columns(3)
+
+        with d1:
+            st.download_button(
+                "⬇️ Processed CSV",
+                data=results["processed_df"].to_csv(
+                    index=False
+                ).encode("utf-8-sig"),
+                file_name=results["output_filename"],
+                mime="text/csv",
+                use_container_width=True
+            )
+
+        with d2:
+            st.download_button(
+                "⬇️ Combined property list",
+                data=results["combined_property_df"].to_csv(
+                    index=False
+                ).encode("utf-8-sig"),
+                file_name=(
+                    results["property_list_output_filename"]
+                ),
+                mime="text/csv",
+                use_container_width=True
+            )
+
+        with d3:
+            st.download_button(
+                "⬇️ Unknown-property review",
+                data=results["unknown_review_df"].to_csv(
+                    index=False
+                ).encode("utf-8-sig"),
+                file_name=results["unknown_output_filename"],
+                mime="text/csv",
+                use_container_width=True
+            )
+
+    # ========================================================
+    # STEP 2 — ACCOUNT REMAPPING
+    #
+    # Adds two new columns — "Classification" and "Adjusted
+    # Amount" — for rows belonging to accounts that mix income
+    # and cost. "Account Name" and "Amount" are never modified.
+    # See ACCOUNT_SPLIT_RULES for the account list and rules.
+    #
+    # Every rule is auto-applied the moment this step loads —
+    # they're lookups, not decisions. The one exception is a
+    # blank "Name" on Credit Card Clearing, which genuinely
+    # needs a human call; that's the only thing you're ever
+    # asked to do here.
+    # ========================================================
+
+    st.divider()
+    st.header("🔀 Step 2 — Account Remapping")
+    st.caption(
+        "Classify accounts that combine income and cost into "
+        "Income / Cost, without touching the original columns."
+    )
+
+    account_name_col = results["account_name_column"]
+    transaction_date_col = results["transaction_date_column"]
+    description_col = results["description_column"]
+    amount_col = results["amount_column"]
+
+    if "stage2_df" not in st.session_state:
+        working_df = results["processed_df"].copy()
+        working_df["Classification"] = ""
+        working_df["Adjusted Amount"] = working_df[amount_col]
+        st.session_state["stage2_df"] = working_df
+        st.session_state["stage2_auto_applied"] = False
+
+    stage2_df = st.session_state["stage2_df"]
+
+    try:
+        name_col = find_column(stage2_df, "Name")
+        transaction_type_col = find_column(
+            stage2_df, "Transaction Type"
+        )
+    except KeyError as error:
+        name_col = None
+        transaction_type_col = None
+        st.error(str(error))
+
+    if name_col and transaction_type_col and amount_col:
+
+        # Runs once per stage2_df — every rule is a lookup, so
+        # there's nothing to review before applying it. This
+        # never overwrites a manual tag: once a row's
+        # Classification is manually set, this pass isn't
+        # re-run against it (guarded by stage2_auto_applied).
+        if not st.session_state.get(
+            "stage2_auto_applied", False
+        ):
+
+            for rule in ACCOUNT_SPLIT_RULES:
+
+                account_mask = get_account_match_mask(
+                    stage2_df, account_name_col,
+                    rule["source_account"]
+                )
+
+                if not account_mask.any():
+                    continue
+
+                matched_index = stage2_df.loc[
+                    account_mask
+                ].index
+
+                final_classification = stage2_df.loc[
+                    account_mask
+                ].apply(
+                    lambda row, _rule=rule: classify_row_for_rule(
+                        row, _rule, name_col,
+                        transaction_type_col, amount_col
+                    ),
+                    axis=1
+                )
+
+                apply_rule_classification(
+                    stage2_df, rule, matched_index,
+                    final_classification, amount_col
+                )
+
+            st.session_state["stage2_df"] = stage2_df
+            st.session_state["stage2_auto_applied"] = True
+
+        account_summaries = []
+
+        for rule in ACCOUNT_SPLIT_RULES:
+
+            account_mask = get_account_match_mask(
+                stage2_df, account_name_col,
+                rule["source_account"]
+            )
+            matched_count = int(account_mask.sum())
+
+            if matched_count == 0:
+                continue
+
+            classification_values = stage2_df.loc[
+                account_mask, "Classification"
+            ]
+            blank_index = classification_values[
+                classification_values.eq("")
+            ].index
+
+            account_summaries.append({
+                "rule": rule,
+                "matched_count": matched_count,
+                "classified_count": (
+                    matched_count - len(blank_index)
+                ),
+                "blank_index": blank_index,
+            })
+
+        total_matched = sum(
+            summary["matched_count"]
+            for summary in account_summaries
+        )
+
+        if total_matched == 0:
+
+            st.info(
+                "No Pass Thru Income transactions found for any "
+                "of the configured accounts."
+            )
+
+        else:
+
+            total_classified = sum(
+                summary["classified_count"]
+                for summary in account_summaries
+            )
+
+            manual_summary = next(
+                (
+                    summary for summary in account_summaries
+                    if summary["rule"].get(
+                        "allow_manual_tagging", False
+                    )
+                ),
+                None
+            )
+
+            needs_input_count = (
+                len(manual_summary["blank_index"])
+                if manual_summary else 0
+            )
+
+            flagged_for_review_count = (
+                total_matched
+                - total_classified
+                - needs_input_count
+            )
+
+            m1, m2, m3, m4 = st.columns(4)
+            m1.metric(
+                "Pass Thru rows matched", f"{total_matched:,}"
+            )
+            m2.metric(
+                "Auto-classified", f"{total_classified:,}"
+            )
+            m3.metric("Needs your input", needs_input_count)
+            m4.metric(
+                "Flagged for review", flagged_for_review_count
+            )
+
+            if needs_input_count == 0 and (
+                flagged_for_review_count == 0
+            ):
+
+                st.success(
+                    "Every Pass Thru Income row is classified "
+                    "— nothing needs review."
+                )
+
+            else:
+
+                st.subheader("Needs review")
+
+                if manual_summary and needs_input_count > 0:
+
+                    manual_rule = manual_summary["rule"]
+                    blank_index = manual_summary["blank_index"]
+
+                    st.markdown(
+                        f"**{manual_rule['source_account']}** "
+                        f"— {needs_input_count} row(s) with a "
+                        "blank Name. Tag each one as Income or "
+                        "Cost:"
+                    )
+
+                    preview_columns = [
+                        transaction_date_col,
+                        name_col,
+                        description_col,
+                        amount_col,
+                    ]
+
+                    unresolved_editor_df = stage2_df.loc[
+                        blank_index, preview_columns
+                    ].copy()
+
+                    unresolved_editor_df["Classification"] = ""
+
+                    edited_df = st.data_editor(
+                        unresolved_editor_df,
+                        column_config={
+                            "Classification": (
+                                st.column_config.SelectboxColumn(
+                                    options=["Income", "Cost"],
+                                    required=True,
+                                )
+                            )
+                        },
+                        disabled=preview_columns,
+                        hide_index=True,
+                        use_container_width=True,
+                        key="stage2_editor_manual"
+                    )
+
+                    all_tagged = all(
+                        value in ("Income", "Cost")
+                        for value in edited_df["Classification"]
+                    )
+
+                    apply_clicked = st.button(
+                        "Apply tags — "
+                        f"{manual_rule['source_account']}",
+                        type="primary",
+                        disabled=not all_tagged,
+                        key="stage2_apply_manual"
+                    )
+
+                    if not all_tagged:
+                        st.caption(
+                            "Tag every row above before "
+                            "applying."
+                        )
+
+                    if apply_clicked:
+
+                        final_classification = pd.Series(
+                            edited_df["Classification"].values,
+                            index=blank_index
+                        )
+
+                        working_df = stage2_df.copy()
+
+                        (
+                            parseable_cost_index,
+                            income_index,
+                            unparseable_cost_index
+                        ) = apply_rule_classification(
+                            working_df, manual_rule, blank_index,
+                            final_classification, amount_col
+                        )
+
+                        st.session_state["stage2_df"] = (
+                            working_df
+                        )
+
+                        st.success(
+                            f"Classified "
+                            f"{len(parseable_cost_index)} "
+                            "row(s) as "
+                            f"'{manual_rule['cost_label']}' and "
+                            f"{len(income_index)} row(s) as "
+                            f"'{manual_rule['income_label']}'."
+                        )
+
+                        if len(unparseable_cost_index) > 0:
+                            st.warning(
+                                f"{len(unparseable_cost_index)} "
+                                "row(s) could not be classified "
+                                "because their Amount could not "
+                                "be parsed."
+                            )
+
+                        st.rerun()
+
+                if flagged_for_review_count > 0:
+
+                    st.markdown(
+                        "**Flagged for review** — Transaction "
+                        "Type not covered by the mapping "
+                        "(nothing was guessed):"
+                    )
+
+                    review_frames = []
+
+                    for summary in account_summaries:
+
+                        rule = summary["rule"]
+
+                        if rule.get(
+                            "allow_manual_tagging", False
+                        ):
+                            continue
+
+                        if len(summary["blank_index"]) == 0:
+                            continue
+
+                        review_frames.append(
+                            stage2_df.loc[
+                                summary["blank_index"],
+                                [
+                                    transaction_date_col,
+                                    account_name_col,
+                                    transaction_type_col,
+                                    name_col,
+                                    amount_col,
+                                ]
+                            ]
+                        )
+
+                    review_df = pd.concat(review_frames)
+
+                    st.dataframe(
+                        review_df,
+                        use_container_width=True,
+                        hide_index=True,
+                        height=min(
+                            420, 60 + 35 * len(review_df)
+                        )
+                    )
+
+            with st.expander(
+                "Per-account detail "
+                f"({len(account_summaries)} accounts)"
+            ):
+                for summary in account_summaries:
+
+                    rule = summary["rule"]
+                    blank_count = len(summary["blank_index"])
+                    status_icon = (
+                        "⚠️" if blank_count > 0 else "✅"
+                    )
+
+                    st.markdown(
+                        f"{status_icon} "
+                        f"**{rule['source_account']}** — "
+                        f"{summary['classified_count']}/"
+                        f"{summary['matched_count']} classified"
+                        f" → `{rule['income_label']}` / "
+                        f"`{rule['cost_label']}`"
+                    )
+
+    stage2_df = st.session_state["stage2_df"]
+
+    st.subheader("Step 2 output")
     st.dataframe(
-        results["processed_df"][
-            results["mapping_preview_columns"]
-        ].head(50)
+        stage2_df,
+        use_container_width=True,
+        height=380
     )
 
-    st.subheader(
-        f"Unknown Property rows "
-        f"({len(results['unknown_review_df'])} total)"
+    stage2_output_filename = results["output_filename"].replace(
+        "_mapped.csv", "_remapped.csv"
     )
-    st.dataframe(results["unknown_review_df"].head(50))
 
-    st.subheader("Downloads")
-
-    col1, col2, col3 = st.columns(3)
-
-    with col1:
-        st.download_button(
-            "Download processed CSV",
-            data=results["processed_df"].to_csv(
-                index=False
-            ).encode("utf-8-sig"),
-            file_name=results["output_filename"],
-            mime="text/csv"
-        )
-
-    with col2:
-        st.download_button(
-            "Download combined property list",
-            data=results["combined_property_df"].to_csv(
-                index=False
-            ).encode("utf-8-sig"),
-            file_name=results["property_list_output_filename"],
-            mime="text/csv"
-        )
-
-    with col3:
-        st.download_button(
-            "Download unknown-property review",
-            data=results["unknown_review_df"].to_csv(
-                index=False
-            ).encode("utf-8-sig"),
-            file_name=results["unknown_output_filename"],
-            mime="text/csv"
-        )
+    st.download_button(
+        "⬇️ Download remapped CSV",
+        data=stage2_df.to_csv(
+            index=False
+        ).encode("utf-8-sig"),
+        file_name=stage2_output_filename,
+        mime="text/csv"
+    )
