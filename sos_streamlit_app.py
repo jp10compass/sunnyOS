@@ -443,6 +443,7 @@ OTA_COMMISSION_TRANSACTION_TYPE_MAP = {
     "refund": "Income",
     "credit memo": "Income",
     "expense": "Cost",
+    "bill": "Cost",
 }
 
 HOA_TRANSACTION_TYPE_MAP = {
