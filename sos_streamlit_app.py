@@ -593,6 +593,28 @@ ACCOUNT_SPLIT_RULES = [
 ]
 
 
+# ============================================================
+# STEP 3: SOFTWARE ACCOUNT VENDOR REMAPPING
+#
+# Rows currently coded to the "Software" account get a new
+# Account Name based on vendor (Name column). Default mapping
+# below is editable in the UI. A vendor not in the table is
+# flagged for review — nothing is guessed.
+# ============================================================
+
+SOFTWARE_SOURCE_ACCOUNT = "Software"
+
+DEFAULT_SOFTWARE_VENDOR_REMAP = {
+    "Anthropic Claude Sub": "Software - Other",
+    "Facebook": "Software - Other",
+    "PieCFOmind LLC": "Software - Other",
+    "Pricelabs": "Software - Other",
+    "Software": "Software - Other",
+    "Streamline": "Software - Other",
+    "Revup Rental": "Software - Revenue Management",
+}
+
+
 def classify_by_transaction_type(rule, transaction_type, amount):
     """
     Centralized classification for every rule_type ==
@@ -2101,6 +2123,18 @@ div[data-testid="stDataFrame"] {
     overflow: hidden;
 }
 
+/* "Where do I get this file?" expanders */
+div[data-testid="stExpander"] {
+    border-radius: 10px;
+    overflow: hidden;
+    border: 1px solid rgba(128, 128, 128, 0.25);
+}
+div[data-testid="stExpander"] summary {
+    font-size: 0.88rem;
+    font-weight: 600;
+    opacity: 0.85;
+}
+
 /* Metrics */
 div[data-testid="stMetric"] {
     background: rgba(128, 128, 128, 0.06);
@@ -2148,41 +2182,94 @@ st.markdown(
     unsafe_allow_html=True
 )
 
+TRANSACTION_HELP_MARKDOWN = """
+**Where to get it:**
+1. QuickBooks Online → **Reports**
+2. Open your saved custom report **P&L GL Detail**
+   (or search "Profit and Loss Detail" and customize it)
+3. Set the date range, then **Export to Excel/CSV**
+
+**Columns needed** (any order):
+- Transaction date
+- Account Name
+- Class full name
+- Description
+- Num
+- Amount
+- Name
+- Transaction Type
+"""
+
+PROPERTY_HELP_MARKDOWN = """
+**Where to get it:**
+1. Open the most recent **Unit Economics** file
+2. Go to the **Property Dimension** tab
+3. Copy the **Unit Name** column into a CSV — one property
+   per row
+
+**Columns needed:**
+- One column of property names (header optional)
+
+💡 Only needed for properties not already built into this
+tool — existing ones don't need to be re-uploaded.
+"""
+
+BOOKING_HELP_MARKDOWN = """
+**Where to get it:**
+1. Streamline → **Reports** → **Reservation Analysis Report**
+2. Pull **full historical data**, plus **at least 6 months
+   into the future** — future bookings can already affect
+   today's books (e.g. long stays), so they need to be
+   included too
+3. Export to CSV
+
+**Columns needed:**
+- Lease ID
+- Unit Name
+"""
+
 file_specs = [
     (
         "📄",
         "Transaction CSV",
         "Original FVRC Profit and Loss Detail export",
-        f"transaction_file_{uploader_version}"
+        f"transaction_file_{uploader_version}",
+        TRANSACTION_HELP_MARKDOWN
     ),
     (
         "🏘️",
         "Property list",
         "Additional one-column property list",
-        f"property_file_{uploader_version}"
+        f"property_file_{uploader_version}",
+        PROPERTY_HELP_MARKDOWN
     ),
     (
         "🔗",
         "Booking lookup",
         "CSV with 'Lease ID' and 'Unit Name'",
-        f"booking_file_{uploader_version}"
+        f"booking_file_{uploader_version}",
+        BOOKING_HELP_MARKDOWN
     ),
 ]
 
 upload_cols = st.columns(3)
 uploaded_files = {}
 
-for col, (icon, title, help_text, widget_key) in zip(
+for col, (icon, title, help_text, widget_key, help_markdown) in zip(
     upload_cols, file_specs
 ):
     with col:
         with st.container(border=True):
             st.markdown(f"**{icon} {title}**")
+            st.caption(help_text)
+
+            with st.expander("📍 Where do I get this file?"):
+                st.markdown(help_markdown)
+
             uploaded_file = st.file_uploader(
                 title,
                 type="csv",
                 key=widget_key,
-                help=help_text,
                 label_visibility="collapsed"
             )
 
@@ -2245,12 +2332,14 @@ if run_clicked:
             st.session_state["sos_results"] = results
 
             # A fresh Step 1 result invalidates any in-progress
-            # Step 2 work (it was built from the previous
-            # dataframe) — clear it so Step 2 can't silently
+            # Step 2/3 work (it was built from the previous
+            # dataframe) — clear it so Step 2/3 can't silently
             # keep operating on stale data.
             for key in list(st.session_state.keys()):
-                if key == "stage2_df" or key.startswith(
-                    "stage2_"
+                if (
+                    key in ("stage2_df", "stage3_df")
+                    or key.startswith("stage2_")
+                    or key.startswith("stage3_")
                 ):
                     del st.session_state[key]
 
@@ -2273,8 +2362,10 @@ if "sos_results" in st.session_state:
     with reset_col:
         if st.button("🔄 Start over", use_container_width=True):
             for key in list(st.session_state.keys()):
-                if key == "sos_results" or key.startswith(
-                    "stage2_"
+                if (
+                    key == "sos_results"
+                    or key.startswith("stage2_")
+                    or key.startswith("stage3_")
                 ):
                     del st.session_state[key]
             st.session_state["uploader_version"] += 1
@@ -2764,5 +2855,150 @@ if "sos_results" in st.session_state:
             index=False
         ).encode("utf-8-sig"),
         file_name=stage2_output_filename,
+        mime="text/csv"
+    )
+
+    # ========================================================
+    # STEP 3 — SOFTWARE ACCOUNT VENDOR REMAPPING
+    #
+    # Only rows already coded to the "Software" account are
+    # touched. Their Account Name is overwritten based on
+    # vendor (Name), using an editable mapping table. A vendor
+    # not in the table is flagged — nothing is guessed.
+    # ========================================================
+
+    st.divider()
+    st.header("🏷️ Step 3 — Software Account Vendor Remapping")
+    st.caption(
+        "Rows in the Software account get a new Account Name "
+        "based on vendor. Edit the table below; unmapped "
+        "vendors are flagged."
+    )
+
+    if "stage3_vendor_map" not in st.session_state:
+        st.session_state["stage3_vendor_map"] = pd.DataFrame(
+            list(DEFAULT_SOFTWARE_VENDOR_REMAP.items()),
+            columns=["Vendor (Name)", "New Account Name"]
+        )
+
+    st.markdown(
+        "**Mapping table** — edit values, or add/remove rows:"
+    )
+
+    vendor_map_editor_df = st.data_editor(
+        st.session_state["stage3_vendor_map"],
+        num_rows="dynamic",
+        use_container_width=True,
+        hide_index=True,
+        key="stage3_vendor_map_editor"
+    )
+
+    st.session_state["stage3_vendor_map"] = vendor_map_editor_df
+
+    vendor_remap_lookup = {}
+
+    for _, map_row in vendor_map_editor_df.iterrows():
+
+        vendor_name = clean_text(map_row["Vendor (Name)"])
+        target_account = clean_text(map_row["New Account Name"])
+
+        if vendor_name != "" and target_account != "":
+            vendor_remap_lookup[
+                normalize_text(vendor_name)
+            ] = target_account
+
+    stage3_df = stage2_df.copy()
+
+    if "Original Account Name" not in stage3_df.columns:
+        stage3_df["Original Account Name"] = (
+            stage3_df[account_name_col]
+        )
+
+    software_mask = get_account_match_mask(
+        stage3_df,
+        account_name_col,
+        SOFTWARE_SOURCE_ACCOUNT
+    )
+
+    software_index = stage3_df.loc[software_mask].index
+
+    vendor_values = (
+        stage3_df.loc[software_index, name_col]
+        .map(clean_text)
+    )
+
+    normalized_vendor_values = vendor_values.map(normalize_text)
+
+    mapped_target = normalized_vendor_values.map(
+        lambda vendor_key: vendor_remap_lookup.get(vendor_key, "")
+    )
+
+    unmapped_index = mapped_target[
+        mapped_target.eq("")
+    ].index
+
+    mapped_index = mapped_target[
+        mapped_target.ne("")
+    ].index
+
+    stage3_df.loc[mapped_index, account_name_col] = (
+        mapped_target.loc[mapped_index]
+    )
+
+    if len(software_index) == 0:
+
+        st.info(
+            "No rows are currently coded to the Software "
+            "account."
+        )
+
+    elif len(unmapped_index) > 0:
+
+        st.warning(
+            f"{len(unmapped_index)} row(s) in the Software "
+            "account have a vendor that's not in the mapping "
+            "table above. Add them to the table to remap them."
+        )
+
+        st.dataframe(
+            stage3_df.loc[
+                unmapped_index,
+                [
+                    transaction_date_col,
+                    "Original Account Name",
+                    name_col,
+                    amount_col
+                ]
+            ],
+            use_container_width=True,
+            hide_index=True
+        )
+
+    else:
+
+        st.success(
+            f"All {len(software_index)} Software-account "
+            "row(s) are mapped."
+        )
+
+    st.session_state["stage3_df"] = stage3_df
+
+    st.subheader("Step 3 output")
+    st.dataframe(
+        stage3_df,
+        use_container_width=True,
+        height=380
+    )
+
+    stage3_output_filename = results["output_filename"].replace(
+        "_mapped.csv", "_remapped_v2.csv"
+    )
+
+    st.download_button(
+        "⬇️ Download Step 3 CSV",
+        data=stage3_df.to_csv(
+            index=False
+        ).encode("utf-8-sig"),
+        file_name=stage3_output_filename,
         mime="text/csv"
     )
