@@ -2855,6 +2855,37 @@ if "sos_results" in st.session_state:
 
             else:
 
+                def owner_match_row_detail(row_index):
+                    """
+                    Full transaction-level context for one
+                    Unknown row — same fields as the rest of the
+                    tool's review tables (plus Amount), so a
+                    match can be verified before it's confirmed.
+                    """
+
+                    return {
+                        "Transaction date": owner_match_df.loc[
+                            row_index,
+                            results["transaction_date_column"]
+                        ],
+                        "Name": owner_match_df.loc[
+                            row_index, owner_match_name_col
+                        ],
+                        "Num": owner_match_df.loc[
+                            row_index, results["num_column"]
+                        ],
+                        "Class full name": owner_match_df.loc[
+                            row_index,
+                            results["class_full_name_column"]
+                        ],
+                        "Description": owner_match_df.loc[
+                            row_index, owner_match_description_col
+                        ],
+                        "Amount": owner_match_df.loc[
+                            row_index, results["amount_column"]
+                        ],
+                    }
+
                 edited_single_df = None
 
                 if single_candidates:
@@ -2867,26 +2898,36 @@ if "sos_results" in st.session_state:
                         "your call."
                     )
 
+                    if (
+                        "owner_match_single_editor_version"
+                        not in st.session_state
+                    ):
+                        st.session_state[
+                            "owner_match_single_editor_version"
+                        ] = 0
+
+                    if st.button(
+                        "Select all",
+                        key="owner_match_select_all_button"
+                    ):
+                        st.session_state[
+                            "owner_match_single_select_all"
+                        ] = True
+                        st.session_state[
+                            "owner_match_single_editor_version"
+                        ] += 1
+                        st.rerun()
+
+                    select_all_active = st.session_state.pop(
+                        "owner_match_single_select_all", False
+                    )
+
                     single_preview_df = pd.DataFrame(
                         [
                             {
-                                "Transaction date": (
-                                    owner_match_df.loc[
-                                        entry["index"],
-                                        results[
-                                            "transaction_date_"
-                                            "column"
-                                        ]
-                                    ]
+                                **owner_match_row_detail(
+                                    entry["index"]
                                 ),
-                                "Name": owner_match_df.loc[
-                                    entry["index"],
-                                    owner_match_name_col
-                                ],
-                                "Description": owner_match_df.loc[
-                                    entry["index"],
-                                    owner_match_description_col
-                                ],
                                 "Matched on": entry[
                                     "matched_field"
                                 ],
@@ -2896,7 +2937,7 @@ if "sos_results" in st.session_state:
                                 "Proposed Property": entry[
                                     "candidate_units"
                                 ][0],
-                                "Confirm": False,
+                                "Confirm": select_all_active,
                             }
                             for entry in single_candidates
                         ],
@@ -2904,6 +2945,13 @@ if "sos_results" in st.session_state:
                             entry["index"]
                             for entry in single_candidates
                         ]
+                    )
+
+                    single_editor_key = (
+                        "owner_match_single_editor_"
+                        + str(st.session_state[
+                            "owner_match_single_editor_version"
+                        ])
                     )
 
                     edited_single_df = st.data_editor(
@@ -2916,16 +2964,17 @@ if "sos_results" in st.session_state:
                             )
                         },
                         disabled=[
-                            "Transaction date", "Name",
-                            "Description", "Matched on",
+                            "Transaction date", "Name", "Num",
+                            "Class full name", "Description",
+                            "Amount", "Matched on",
                             "Matched Owner", "Proposed Property"
                         ],
                         hide_index=True,
                         use_container_width=True,
-                        key="owner_match_single_editor"
+                        key=single_editor_key
                     )
 
-                confirmed_multi = {}
+                edited_multi_groups = []
 
                 if multi_candidates:
 
@@ -2933,46 +2982,99 @@ if "sos_results" in st.session_state:
                         "Multiple candidates — pick one"
                     )
                     st.caption(
-                        "Can't guess which — choose the right "
-                        "Property, or leave it as Unknown."
+                        "Grouped by which properties came up, so "
+                        "every affected transaction is visible "
+                        "together. Can't guess which — choose "
+                        "the right Property per row, or leave it "
+                        "Unknown."
                     )
 
+                    multi_groups = {}
+
                     for entry in multi_candidates:
+                        multi_groups.setdefault(
+                            tuple(entry["candidate_units"]), []
+                        ).append(entry)
 
-                        row_index = entry["index"]
-                        row = owner_match_df.loc[row_index]
+                    for candidate_units, group_entries in (
+                        multi_groups.items()
+                    ):
 
-                        multi_cols = st.columns([3, 2])
+                        owners_in_group = sorted(set(
+                            owner
+                            for group_entry in group_entries
+                            for owner in group_entry[
+                                "matched_owners"
+                            ]
+                        ))
 
-                        with multi_cols[0]:
-                            st.markdown(
-                                "**"
-                                f"{row[owner_match_name_col] or '(blank Name)'}"
-                                "**  \n"
-                                f"{row[owner_match_description_col]}"
+                        st.markdown(
+                            f"**{' or '.join(candidate_units)}**"
+                            f" — via {', '.join(owners_in_group)}"
+                            f" ({len(group_entries)} "
+                            "transaction(s))"
+                        )
+
+                        group_preview_df = pd.DataFrame(
+                            [
+                                {
+                                    **owner_match_row_detail(
+                                        group_entry["index"]
+                                    ),
+                                    "Matched on": group_entry[
+                                        "matched_field"
+                                    ],
+                                    "Matched Owner": ", ".join(
+                                        group_entry[
+                                            "matched_owners"
+                                        ]
+                                    ),
+                                    "Property": (
+                                        "— not confirmed —"
+                                    ),
+                                }
+                                for group_entry in group_entries
+                            ],
+                            index=[
+                                group_entry["index"]
+                                for group_entry in group_entries
+                            ]
+                        )
+
+                        group_key_suffix = "_".join(
+                            unit.strip().lower().replace(" ", "-")
+                            for unit in candidate_units
+                        )
+
+                        edited_group_df = st.data_editor(
+                            group_preview_df,
+                            column_config={
+                                "Property": (
+                                    st.column_config.SelectboxColumn(
+                                        options=(
+                                            ["— not confirmed —"]
+                                            + list(candidate_units)
+                                        )
+                                    )
+                                )
+                            },
+                            disabled=[
+                                "Transaction date", "Name", "Num",
+                                "Class full name", "Description",
+                                "Amount", "Matched on",
+                                "Matched Owner"
+                            ],
+                            hide_index=True,
+                            use_container_width=True,
+                            key=(
+                                "owner_match_multi_editor_"
+                                f"{group_key_suffix}"
                             )
-                            st.caption(
-                                f"Matched on {entry['matched_field']}"
-                                " — "
-                                f"{', '.join(entry['matched_owners'])}"
-                            )
+                        )
 
-                        with multi_cols[1]:
-                            selection = st.selectbox(
-                                "Property",
-                                options=(
-                                    ["— not confirmed —"]
-                                    + entry["candidate_units"]
-                                ),
-                                key=(
-                                    f"owner_match_multi_"
-                                    f"{row_index}"
-                                ),
-                                label_visibility="collapsed"
-                            )
-
-                        if selection != "— not confirmed —":
-                            confirmed_multi[row_index] = selection
+                        edited_multi_groups.append(
+                            (group_entries, edited_group_df)
+                        )
 
                 apply_clicked = st.button(
                     "Apply confirmed matches",
@@ -2999,6 +3101,20 @@ if "sos_results" in st.session_state:
                             owner_match_df.loc[
                                 entry["index"], "Property"
                             ] = entry["candidate_units"][0]
+
+                    confirmed_multi = {}
+
+                    for group_entries, edited_group_df in (
+                        edited_multi_groups
+                    ):
+                        for group_entry, chosen in zip(
+                            group_entries,
+                            edited_group_df["Property"].values
+                        ):
+                            if chosen != "— not confirmed —":
+                                confirmed_multi[
+                                    group_entry["index"]
+                                ] = chosen
 
                     for row_index, property_value in (
                         confirmed_multi.items()
