@@ -412,18 +412,28 @@ CORPORATE_ACCOUNT_NAMES = [
 # rule_type == "transaction_type_based":
 #   Classification comes from the single centralized
 #   classify_by_transaction_type() function below, driven by
-#   each rule's "transaction_type_map" (and, optionally,
-#   "sign_based_types" for accounts where a specific Transaction
-#   Type is decided by the Amount sign instead of a fixed
-#   lookup — see Housekeeping Clearing). Amount sign is NOT used
-#   unless a type is explicitly listed in "sign_based_types".
-#   Transaction Types not covered by the rule are left
-#   unclassified and flagged for review — nothing is asked of
-#   the user.
+#   one of two mappings on the rule (never both):
+#   - "transaction_type_map" (and, optionally, "sign_based_types"
+#     for accounts where a specific Transaction Type is decided
+#     by the Amount sign instead of a fixed lookup — see
+#     Housekeeping Clearing). Amount sign is NOT used unless a
+#     type is explicitly listed in "sign_based_types".
+#   - "transaction_type_sign_map", for accounts where the sign of
+#     the Amount matters PER Transaction Type rather than as a
+#     fixed lookup or a uniform sign rule — e.g. {"bill":
+#     {"positive": "Cost", "zero": "Cost"}} maps a positive or
+#     zero Bill to Cost and leaves a negative Bill unclassified
+#     (see the Maintenance accounts). Any Transaction Type, or
+#     any sign of a listed Transaction Type, missing from the map
+#     is left unclassified and flagged for review.
+#   Either way, Transaction Types (or signs) not covered by the
+#   rule are left unclassified and flagged for review — nothing
+#   is asked of the user.
 #
 # To add another account: add a new rule entry (and, for
-# transaction_type_based rules, a new *_TRANSACTION_TYPE_MAP
-# dict below). Do not write a new classification function.
+# transaction_type_based rules, a new *_TRANSACTION_TYPE_MAP or
+# *_TRANSACTION_TYPE_SIGN_MAP dict below). Do not write a new
+# classification function.
 # ============================================================
 
 HOUSEKEEPING_TRANSACTION_TYPE_MAP = {
@@ -486,6 +496,38 @@ APP_FEE_TRANSACTION_TYPE_MAP = {
     "credit memo": "Income",
     "expense": "Cost",
 }
+
+# Maintenance accounts are not Income/Cost — we pay the vendor
+# (Cost) and bill the owner back by reducing their balance, no
+# cash actually changes hands (Billback, displayed via each
+# rule's income_label; "Income" is only the internal bucket name
+# shared with every other transaction_type_based rule).
+#
+# Zero-amount rows never affect the P&L either way, so they're
+# tagged Cost rather than left blank. Any sign not listed below
+# (e.g. a negative Bill, a positive Vendor Credit) doesn't exist
+# in the data as of 2026-08-26 — if one appears, it's flagged for
+# review rather than guessed.
+MAINTENANCE_TRANSACTION_TYPE_SIGN_MAP = {
+    "bill": {"positive": "Cost", "zero": "Cost"},
+    "expense": {"positive": "Cost", "zero": "Cost"},
+    "vendor credit": {"negative": "Income", "zero": "Cost"},
+    "journal entry": {
+        "positive": "Cost", "zero": "Cost", "negative": "Income"
+    },
+}
+
+MAINTENANCE_SUB_ACCOUNTS = [
+    "Appliances",
+    "Electric",
+    "HVAC Repairs",
+    "Inhouse Repairs",
+    "Inventory",
+    "Landscape",
+    "Plumbing",
+    "Pool",
+    "Upholstery",
+]
 
 ACCOUNT_SPLIT_RULES = [
     {
@@ -590,6 +632,18 @@ ACCOUNT_SPLIT_RULES = [
         # row still classifies by its Transaction Type.
         "sign_based_types": set(),
     },
+] + [
+    {
+        "source_account": f"Maintenance:{sub_account}",
+        "income_label": f"Maintenance - {sub_account} Billback",
+        "cost_label": f"Maintenance - {sub_account} Cost",
+        "rule_type": "transaction_type_based",
+        "allow_manual_tagging": False,
+        "transaction_type_sign_map": (
+            MAINTENANCE_TRANSACTION_TYPE_SIGN_MAP
+        ),
+    }
+    for sub_account in MAINTENANCE_SUB_ACCOUNTS
 ]
 
 
@@ -620,19 +674,39 @@ def classify_by_transaction_type(rule, transaction_type, amount):
     Centralized classification for every rule_type ==
     "transaction_type_based" account (see ACCOUNT_SPLIT_RULES).
 
-    - If the (normalized) Transaction Type is listed in the
-      rule's "sign_based_types", classify by the Amount sign:
-      negative -> Cost, zero or positive -> Income.
+    - If the rule has a "transaction_type_sign_map", look the
+      Transaction Type up in it, then look the Amount's sign
+      ("positive" / "negative" / "zero") up within that. Missing
+      either way returns "" — unclassified, flagged for review.
+    - Otherwise, if the (normalized) Transaction Type is listed
+      in the rule's "sign_based_types", classify by the Amount
+      sign: negative -> Cost, zero or positive -> Income.
     - Otherwise, look the Transaction Type up in the rule's
       "transaction_type_map".
-    - If it isn't found either way, return "" — unclassified,
-      flagged for review.
+    - If it isn't found any of those ways, return "" —
+      unclassified, flagged for review.
 
     Add a new account by adding a rule + a transaction type map,
     not by writing a new function.
     """
 
     normalized_type = normalize_text(transaction_type)
+
+    sign_map = rule.get("transaction_type_sign_map")
+
+    if sign_map is not None:
+
+        if amount is None or normalized_type not in sign_map:
+            return ""
+
+        if amount > 0:
+            sign_key = "positive"
+        elif amount < 0:
+            sign_key = "negative"
+        else:
+            sign_key = "zero"
+
+        return sign_map[normalized_type].get(sign_key, "")
 
     if normalized_type in rule.get("sign_based_types", set()):
 
@@ -2044,6 +2118,98 @@ def process_files(transaction_file, additional_property_file, booking_file):
 
 
 # ============================================================
+# STEP 1B: OWNER NAME MATCHING
+#
+# Last resort for rows still tagged "Unknown" after Step 1's
+# Class / Description / Booking cascade. An uploaded Owner CSV
+# (Owner First Name, Owner Last Name, Unit Name — one row per
+# property an owner holds) is checked against each Unknown row's
+# Name, then Description if Name has no match.
+#
+# A match requires the owner's first AND last name to each
+# appear as a whole word somewhere in the (normalized) field —
+# in any order, ignoring extra words. This assumes single-word
+# first/last names; a multi-word surname is not handled.
+#
+# This never decides anything by itself — see the Streamlit
+# section below for the confirm-before-apply UI. It only reports
+# candidates.
+# ============================================================
+
+def normalize_name_tokens(value):
+    """
+    Whole-word token set for owner-name matching (blank-safe).
+    """
+
+    normalized = normalize_text(value)
+
+    if normalized == "":
+        return set()
+
+    return set(normalized.split())
+
+
+def match_owner_candidates(text_tokens, owner_records):
+    """
+    Every owner_records entry is (first_token, last_token,
+    display_name, unit_name). Returns (matched_owner_display_names,
+    candidate_unit_names) for every owner whose first AND last
+    token both appear in text_tokens — both sorted and
+    deduplicated. A single owner with several units, and two
+    different owners who share a name, come back the same way:
+    as more than one candidate unit name.
+    """
+
+    matched_owners = set()
+    candidate_units = set()
+
+    for first_token, last_token, display_name, unit_name in (
+        owner_records
+    ):
+
+        if first_token in text_tokens and last_token in text_tokens:
+            matched_owners.add(display_name)
+            candidate_units.add(unit_name)
+
+    return sorted(matched_owners), sorted(candidate_units)
+
+
+def find_owner_match_for_row(
+    name_value, description_value, owner_records
+):
+    """
+    Try Name first; Description is only checked when Name finds
+    nothing. Returns (matched_field, matched_owner_display_names,
+    candidate_unit_names) — matched_field is "" when neither
+    field matched any owner.
+    """
+
+    name_matched_owners, name_candidate_units = (
+        match_owner_candidates(
+            normalize_name_tokens(name_value), owner_records
+        )
+    )
+
+    if name_candidate_units:
+        return "Name", name_matched_owners, name_candidate_units
+
+    description_matched_owners, description_candidate_units = (
+        match_owner_candidates(
+            normalize_name_tokens(description_value),
+            owner_records
+        )
+    )
+
+    if description_candidate_units:
+        return (
+            "Description", description_matched_owners,
+            description_candidate_units
+        )
+
+    return "", [], []
+
+
+# ============================================================
 # STREAMLIT PAGE
 # ============================================================
 
@@ -2184,7 +2350,7 @@ st.markdown(
 
 TRANSACTION_HELP_MARKDOWN = """
 **Where to get it:**
-1. QuickBooks Online → **Reports**
+1. QuickBooks Online → **Reports** → **Custom Reports**
 2. Open your saved custom report **P&L GL Detail**
    (or search "Profit and Loss Detail" and customize it)
 3. Set the date range, then **Export to Excel/CSV**
@@ -2197,6 +2363,7 @@ TRANSACTION_HELP_MARKDOWN = """
 - Num
 - Amount
 - Name
+- Customer
 - Transaction Type
 """
 
@@ -2226,6 +2393,25 @@ BOOKING_HELP_MARKDOWN = """
 **Columns needed:**
 - Lease ID
 - Unit Name
+"""
+
+OWNER_HELP_MARKDOWN = """
+**Where to get it:**
+Export or maintain a CSV of your property owners — however you
+currently track that list.
+*(Placeholder — tell me the real source and I'll write the
+actual steps here.)*
+
+**Columns needed** (any order):
+- Owner First Name
+- Owner Last Name
+- Unit Name
+
+One row per property an owner holds — an owner with three units
+appears as three rows.
+
+💡 Optional. Only used to try matching rows still tagged
+Unknown after Property, Description, and Booking matching.
 """
 
 file_specs = [
@@ -2332,14 +2518,15 @@ if run_clicked:
             st.session_state["sos_results"] = results
 
             # A fresh Step 1 result invalidates any in-progress
-            # Step 2/3 work (it was built from the previous
-            # dataframe) — clear it so Step 2/3 can't silently
+            # Step 1B/2/3 work (it was built from the previous
+            # dataframe) — clear it so later steps can't silently
             # keep operating on stale data.
             for key in list(st.session_state.keys()):
                 if (
                     key in ("stage2_df", "stage3_df")
                     or key.startswith("stage2_")
                     or key.startswith("stage3_")
+                    or key.startswith("owner_match_")
                 ):
                     del st.session_state[key]
 
@@ -2366,6 +2553,7 @@ if "sos_results" in st.session_state:
                     key == "sos_results"
                     or key.startswith("stage2_")
                     or key.startswith("stage3_")
+                    or key.startswith("owner_match_")
                 ):
                     del st.session_state[key]
             st.session_state["uploader_version"] += 1
@@ -2486,6 +2674,355 @@ if "sos_results" in st.session_state:
             )
 
     # ========================================================
+    # STEP 1B — OWNER NAME MATCHING
+    #
+    # Optional last resort for rows still tagged "Unknown". See
+    # find_owner_match_for_row() / match_owner_candidates() above
+    # for the matching rule. Nothing is auto-applied here — every
+    # proposed match needs an explicit confirm before "Apply".
+    # ========================================================
+
+    st.divider()
+    st.header("🔗 Step 1B — Owner Name Matching")
+    st.caption(
+        "Optional last resort for rows still tagged Unknown. "
+        "Every match is proposed, never assumed — you confirm "
+        "each one."
+    )
+
+    if "owner_match_df" not in st.session_state:
+        st.session_state["owner_match_df"] = (
+            results["processed_df"].copy()
+        )
+
+    owner_match_df = st.session_state["owner_match_df"]
+
+    owner_file = st.file_uploader(
+        "Owner CSV — Owner First Name, Owner Last Name, "
+        "Unit Name",
+        type="csv",
+        key="owner_match_uploader"
+    )
+
+    with st.expander("📍 Where do I get this file?"):
+        st.markdown(OWNER_HELP_MARKDOWN)
+
+    skip_col, undo_col = st.columns([1, 3])
+
+    with skip_col:
+        if st.button(
+            "Skip this step", key="owner_match_skip_button"
+        ):
+            st.session_state["owner_match_skipped"] = True
+
+    if st.session_state.get("owner_match_skipped", False):
+
+        with undo_col:
+            if st.button(
+                "Show matching instead",
+                key="owner_match_undo_skip_button"
+            ):
+                st.session_state["owner_match_skipped"] = False
+                st.rerun()
+
+        st.info(
+            "Skipped — every remaining row stays exactly "
+            "Unknown."
+        )
+
+    elif owner_file is None:
+        st.caption(
+            "Upload an Owner CSV to try matching the remaining "
+            "Unknown rows by name."
+        )
+
+    else:
+
+        owner_df = None
+
+        try:
+            owner_df = read_csv_with_header(owner_file)
+            owner_first_col = find_column(
+                owner_df, "Owner First Name"
+            )
+            owner_last_col = find_column(
+                owner_df, "Owner Last Name"
+            )
+            owner_unit_col = find_column(owner_df, "Unit Name")
+            owner_match_name_col = find_column(
+                owner_match_df, "Name"
+            )
+            owner_match_description_col = (
+                results["description_column"]
+            )
+
+        except KeyError as error:
+            owner_df = None
+            st.error(str(error))
+
+        if owner_df is not None:
+
+            owner_records = []
+
+            for _, owner_row in owner_df.iterrows():
+
+                first_token = normalize_text(
+                    owner_row[owner_first_col]
+                )
+                last_token = normalize_text(
+                    owner_row[owner_last_col]
+                )
+                unit_name = clean_text(
+                    owner_row[owner_unit_col]
+                )
+
+                if (
+                    first_token == "" or last_token == ""
+                    or unit_name == ""
+                ):
+                    continue
+
+                display_name = (
+                    f"{clean_text(owner_row[owner_first_col])} "
+                    f"{clean_text(owner_row[owner_last_col])}"
+                )
+
+                owner_records.append((
+                    first_token, last_token, display_name,
+                    unit_name
+                ))
+
+            unknown_index = owner_match_df.loc[
+                owner_match_df["Property"].eq("Unknown")
+            ].index
+
+            single_candidates = []
+            multi_candidates = []
+
+            for row_index in unknown_index:
+
+                row = owner_match_df.loc[row_index]
+
+                matched_field, matched_owners, candidate_units = (
+                    find_owner_match_for_row(
+                        row[owner_match_name_col],
+                        row[owner_match_description_col],
+                        owner_records
+                    )
+                )
+
+                if not candidate_units:
+                    continue
+
+                entry = {
+                    "index": row_index,
+                    "matched_field": matched_field,
+                    "matched_owners": matched_owners,
+                    "candidate_units": candidate_units,
+                }
+
+                if len(candidate_units) == 1:
+                    single_candidates.append(entry)
+                else:
+                    multi_candidates.append(entry)
+
+            no_match_count = (
+                len(unknown_index)
+                - len(single_candidates)
+                - len(multi_candidates)
+            )
+
+            s1, s2, s3, s4 = st.columns(4)
+            s1.metric(
+                "Unknown rows checked", f"{len(unknown_index):,}"
+            )
+            s2.metric(
+                "Single-candidate matches",
+                f"{len(single_candidates):,}"
+            )
+            s3.metric(
+                "Multi-candidate matches",
+                f"{len(multi_candidates):,}"
+            )
+            s4.metric("No match found", f"{no_match_count:,}")
+
+            if not single_candidates and not multi_candidates:
+
+                st.success(
+                    "No name matches found in the remaining "
+                    "Unknown rows — nothing to confirm here."
+                )
+
+            else:
+
+                edited_single_df = None
+
+                if single_candidates:
+
+                    st.subheader(
+                        "Single match — confirm to apply"
+                    )
+                    st.caption(
+                        "Exactly one property came up. Still "
+                        "your call."
+                    )
+
+                    single_preview_df = pd.DataFrame(
+                        [
+                            {
+                                "Transaction date": (
+                                    owner_match_df.loc[
+                                        entry["index"],
+                                        results[
+                                            "transaction_date_"
+                                            "column"
+                                        ]
+                                    ]
+                                ),
+                                "Name": owner_match_df.loc[
+                                    entry["index"],
+                                    owner_match_name_col
+                                ],
+                                "Description": owner_match_df.loc[
+                                    entry["index"],
+                                    owner_match_description_col
+                                ],
+                                "Matched on": entry[
+                                    "matched_field"
+                                ],
+                                "Matched Owner": ", ".join(
+                                    entry["matched_owners"]
+                                ),
+                                "Proposed Property": entry[
+                                    "candidate_units"
+                                ][0],
+                                "Confirm": False,
+                            }
+                            for entry in single_candidates
+                        ],
+                        index=[
+                            entry["index"]
+                            for entry in single_candidates
+                        ]
+                    )
+
+                    edited_single_df = st.data_editor(
+                        single_preview_df,
+                        column_config={
+                            "Confirm": (
+                                st.column_config.CheckboxColumn(
+                                    default=False
+                                )
+                            )
+                        },
+                        disabled=[
+                            "Transaction date", "Name",
+                            "Description", "Matched on",
+                            "Matched Owner", "Proposed Property"
+                        ],
+                        hide_index=True,
+                        use_container_width=True,
+                        key="owner_match_single_editor"
+                    )
+
+                confirmed_multi = {}
+
+                if multi_candidates:
+
+                    st.subheader(
+                        "Multiple candidates — pick one"
+                    )
+                    st.caption(
+                        "Can't guess which — choose the right "
+                        "Property, or leave it as Unknown."
+                    )
+
+                    for entry in multi_candidates:
+
+                        row_index = entry["index"]
+                        row = owner_match_df.loc[row_index]
+
+                        multi_cols = st.columns([3, 2])
+
+                        with multi_cols[0]:
+                            st.markdown(
+                                "**"
+                                f"{row[owner_match_name_col] or '(blank Name)'}"
+                                "**  \n"
+                                f"{row[owner_match_description_col]}"
+                            )
+                            st.caption(
+                                f"Matched on {entry['matched_field']}"
+                                " — "
+                                f"{', '.join(entry['matched_owners'])}"
+                            )
+
+                        with multi_cols[1]:
+                            selection = st.selectbox(
+                                "Property",
+                                options=(
+                                    ["— not confirmed —"]
+                                    + entry["candidate_units"]
+                                ),
+                                key=(
+                                    f"owner_match_multi_"
+                                    f"{row_index}"
+                                ),
+                                label_visibility="collapsed"
+                            )
+
+                        if selection != "— not confirmed —":
+                            confirmed_multi[row_index] = selection
+
+                apply_clicked = st.button(
+                    "Apply confirmed matches",
+                    type="primary",
+                    key="owner_match_apply_button"
+                )
+
+                if apply_clicked:
+
+                    confirmed_single_index = []
+
+                    if edited_single_df is not None:
+                        confirmed_single_index = [
+                            entry["index"]
+                            for entry, confirmed in zip(
+                                single_candidates,
+                                edited_single_df["Confirm"].values
+                            )
+                            if confirmed
+                        ]
+
+                    for entry in single_candidates:
+                        if entry["index"] in confirmed_single_index:
+                            owner_match_df.loc[
+                                entry["index"], "Property"
+                            ] = entry["candidate_units"][0]
+
+                    for row_index, property_value in (
+                        confirmed_multi.items()
+                    ):
+                        owner_match_df.loc[
+                            row_index, "Property"
+                        ] = property_value
+
+                    st.session_state["owner_match_df"] = (
+                        owner_match_df
+                    )
+
+                    resolved_count = (
+                        len(confirmed_single_index)
+                        + len(confirmed_multi)
+                    )
+                    st.success(
+                        f"{resolved_count} row(s) resolved to a "
+                        "Property. Everything else left as "
+                        "Unknown."
+                    )
+                    st.rerun()
+
+    # ========================================================
     # STEP 2 — ACCOUNT REMAPPING
     #
     # Adds two new columns — "Classification" and "Adjusted
@@ -2503,8 +3040,9 @@ if "sos_results" in st.session_state:
     st.divider()
     st.header("🔀 Step 2 — Account Remapping")
     st.caption(
-        "Classify accounts that combine income and cost into "
-        "Income / Cost, without touching the original columns."
+        "Split mixed accounts into their component parts — "
+        "Income/Cost for Pass Thru accounts, Cost/Billback for "
+        "Maintenance — without touching the original columns."
     )
 
     account_name_col = results["account_name_column"]
@@ -2513,7 +3051,12 @@ if "sos_results" in st.session_state:
     amount_col = results["amount_column"]
 
     if "stage2_df" not in st.session_state:
-        working_df = results["processed_df"].copy()
+        # Carries forward any rows Step 1B resolved by owner
+        # name; falls back to Step 1's own output untouched when
+        # Step 1B was skipped or never used.
+        working_df = st.session_state.get(
+            "owner_match_df", results["processed_df"]
+        ).copy()
         working_df["Classification"] = ""
         working_df["Adjusted Amount"] = working_df[amount_col]
         st.session_state["stage2_df"] = working_df
@@ -2611,8 +3154,8 @@ if "sos_results" in st.session_state:
         if total_matched == 0:
 
             st.info(
-                "No Pass Thru Income transactions found for any "
-                "of the configured accounts."
+                "No transactions found for any of the "
+                "configured accounts."
             )
 
         else:
@@ -2660,7 +3203,7 @@ if "sos_results" in st.session_state:
             ):
 
                 st.success(
-                    "Every Pass Thru Income row is classified "
+                    "Every configured-account row is classified "
                     "— nothing needs review."
                 )
 
