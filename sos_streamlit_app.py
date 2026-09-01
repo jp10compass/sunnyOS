@@ -650,23 +650,27 @@ ACCOUNT_SPLIT_RULES = [
 # ============================================================
 # STEP 3: SOFTWARE ACCOUNT VENDOR REMAPPING
 #
-# Rows currently coded to the "Software" account get a new
-# Account Name based on vendor (Name column). Default mapping
-# below is editable in the UI. A vendor not in the table is
-# flagged for review — nothing is guessed.
+# Every row coded to the "Software" account gets its Account
+# Name overwritten with one of two targets:
+#
+#   - Name contains one of the Revenue Management match terms
+#     (case-insensitive substring)      -> Revenue Management
+#   - everything else, blank Name included -> Software - Other
+#
+# Only the short Revenue Management list is maintained — the
+# long, growing tail of software vendors is swept into
+# Software - Other. Nothing is left as bare "Software". The
+# match terms and both account names are editable in the UI.
 # ============================================================
 
 SOFTWARE_SOURCE_ACCOUNT = "Software"
+SOFTWARE_REVENUE_MANAGEMENT_ACCOUNT = "Software - Revenue Management"
+SOFTWARE_OTHER_ACCOUNT = "Software - Other"
 
-DEFAULT_SOFTWARE_VENDOR_REMAP = {
-    "Anthropic Claude Sub": "Software - Other",
-    "Facebook": "Software - Other",
-    "PieCFOmind LLC": "Software - Other",
-    "Pricelabs": "Software - Other",
-    "Software": "Software - Other",
-    "Streamline": "Software - Other",
-    "Revup Rental": "Software - Revenue Management",
-}
+# Software rows whose Name contains one of these terms
+# (case-insensitive) -> Revenue Management. Everything else in the
+# Software account -> Software - Other.
+DEFAULT_SOFTWARE_REVENUE_MANAGEMENT_TERMS = ["revup"]
 
 
 def classify_by_transaction_type(rule, transaction_type, amount):
@@ -2397,10 +2401,12 @@ BOOKING_HELP_MARKDOWN = """
 
 OWNER_HELP_MARKDOWN = """
 **Where to get it:**
-Export or maintain a CSV of your property owners — however you
-currently track that list.
-*(Placeholder — tell me the real source and I'll write the
-actual steps here.)*
+1. Open the latest **Property Level P&L** (Google Sheets)
+2. Go to the **Unique Properties with Owners** tab — it lists
+   every unique property with its owner, with columns
+   Owner First Name, Owner Last Name, Unit Name
+3. **File → Download → Comma-separated values (.csv)** to
+   download that tab
 
 **Columns needed** (any order):
 - Owner First Name
@@ -3520,58 +3526,90 @@ if "sos_results" in st.session_state:
     # ========================================================
     # STEP 3 — SOFTWARE ACCOUNT VENDOR REMAPPING
     #
-    # Only rows already coded to the "Software" account are
-    # touched. Their Account Name is overwritten based on
-    # vendor (Name), using an editable mapping table. A vendor
-    # not in the table is flagged — nothing is guessed.
+    # Every row coded to the "Software" account is remapped:
+    #   - Name contains a Revenue Management match term
+    #     (case-insensitive substring) -> Revenue Management
+    #   - everything else, blank Name included -> Software - Other
+    #
+    # Only the short Revenue Management list is maintained; the
+    # growing tail of software vendors is swept into
+    # Software - Other. Nothing is left as bare "Software". Both
+    # the match terms and the two account names are editable.
     # ========================================================
 
     st.divider()
     st.header("🏷️ Step 3 — Software Account Vendor Remapping")
     st.caption(
-        "Rows in the Software account get a new Account Name "
-        "based on vendor. Edit the table below; unmapped "
-        "vendors are flagged."
+        "Every Software-account row is remapped: vendors matching "
+        "a Revenue Management term go to that account, everything "
+        "else goes to Software - Other."
     )
 
-    if "stage3_vendor_map" not in st.session_state:
-        st.session_state["stage3_vendor_map"] = pd.DataFrame(
-            list(DEFAULT_SOFTWARE_VENDOR_REMAP.items()),
-            columns=["Vendor (Name)", "New Account Name"]
+    SOFTWARE_TERM_COLUMN = (
+        "Revenue Management match term (Name contains, "
+        "case-insensitive)"
+    )
+
+    if "stage3_revmgmt_terms" not in st.session_state:
+        st.session_state["stage3_revmgmt_terms"] = pd.DataFrame(
+            {
+                SOFTWARE_TERM_COLUMN: list(
+                    DEFAULT_SOFTWARE_REVENUE_MANAGEMENT_TERMS
+                )
+            }
         )
 
-    st.markdown(
-        "**Mapping table** — edit values, or add/remove rows:"
+    account_name_cols = st.columns(2)
+
+    with account_name_cols[0]:
+        revmgmt_account_name = st.text_input(
+            "Revenue Management account name",
+            value=SOFTWARE_REVENUE_MANAGEMENT_ACCOUNT,
+            key="stage3_revmgmt_account"
+        )
+
+    with account_name_cols[1]:
+        other_account_name = st.text_input(
+            "Other account name (everything else in Software)",
+            value=SOFTWARE_OTHER_ACCOUNT,
+            key="stage3_other_account"
+        )
+
+    revmgmt_account_name = (
+        clean_text(revmgmt_account_name)
+        or SOFTWARE_REVENUE_MANAGEMENT_ACCOUNT
+    )
+    other_account_name = (
+        clean_text(other_account_name) or SOFTWARE_OTHER_ACCOUNT
     )
 
-    vendor_map_editor_df = st.data_editor(
-        st.session_state["stage3_vendor_map"],
+    st.markdown(
+        "**Revenue Management vendors** — a Software row whose "
+        "Name contains any term below is remapped to the Revenue "
+        "Management account. Add or remove rows as needed:"
+    )
+
+    revmgmt_terms_editor_df = st.data_editor(
+        st.session_state["stage3_revmgmt_terms"],
         num_rows="dynamic",
         use_container_width=True,
         hide_index=True,
-        key="stage3_vendor_map_editor"
+        key="stage3_revmgmt_terms_editor"
     )
 
-    st.session_state["stage3_vendor_map"] = vendor_map_editor_df
+    st.session_state["stage3_revmgmt_terms"] = (
+        revmgmt_terms_editor_df
+    )
 
-    vendor_remap_lookup = {}
-
-    for _, map_row in vendor_map_editor_df.iterrows():
-
-        vendor_name = clean_text(map_row["Vendor (Name)"])
-        target_account = clean_text(map_row["New Account Name"])
-
-        if vendor_name != "" and target_account != "":
-            vendor_remap_lookup[
-                normalize_text(vendor_name)
-            ] = target_account
+    revenue_management_terms = [
+        normalize_text(term)
+        for term in revmgmt_terms_editor_df[
+            SOFTWARE_TERM_COLUMN
+        ].tolist()
+        if normalize_text(term) != ""
+    ]
 
     stage3_df = stage2_df.copy()
-
-    if "Original Account Name" not in stage3_df.columns:
-        stage3_df["Original Account Name"] = (
-            stage3_df[account_name_col]
-        )
 
     software_mask = get_account_match_mask(
         stage3_df,
@@ -3581,29 +3619,6 @@ if "sos_results" in st.session_state:
 
     software_index = stage3_df.loc[software_mask].index
 
-    vendor_values = (
-        stage3_df.loc[software_index, name_col]
-        .map(clean_text)
-    )
-
-    normalized_vendor_values = vendor_values.map(normalize_text)
-
-    mapped_target = normalized_vendor_values.map(
-        lambda vendor_key: vendor_remap_lookup.get(vendor_key, "")
-    )
-
-    unmapped_index = mapped_target[
-        mapped_target.eq("")
-    ].index
-
-    mapped_index = mapped_target[
-        mapped_target.ne("")
-    ].index
-
-    stage3_df.loc[mapped_index, account_name_col] = (
-        mapped_target.loc[mapped_index]
-    )
-
     if len(software_index) == 0:
 
         st.info(
@@ -3611,34 +3626,79 @@ if "sos_results" in st.session_state:
             "account."
         )
 
-    elif len(unmapped_index) > 0:
-
-        st.warning(
-            f"{len(unmapped_index)} row(s) in the Software "
-            "account have a vendor that's not in the mapping "
-            "table above. Add them to the table to remap them."
-        )
-
-        st.dataframe(
-            stage3_df.loc[
-                unmapped_index,
-                [
-                    transaction_date_col,
-                    "Original Account Name",
-                    name_col,
-                    amount_col
-                ]
-            ],
-            use_container_width=True,
-            hide_index=True
-        )
-
     else:
 
-        st.success(
-            f"All {len(software_index)} Software-account "
-            "row(s) are mapped."
+        vendor_values = (
+            stage3_df.loc[software_index, name_col]
+            .map(clean_text)
         )
+
+        normalized_vendor_values = vendor_values.map(
+            normalize_text
+        )
+
+        def is_revenue_management_vendor(vendor_key):
+            return any(
+                term in vendor_key
+                for term in revenue_management_terms
+            )
+
+        revmgmt_row_mask = normalized_vendor_values.map(
+            is_revenue_management_vendor
+        )
+
+        revmgmt_index = revmgmt_row_mask[revmgmt_row_mask].index
+        other_index = revmgmt_row_mask[~revmgmt_row_mask].index
+
+        stage3_df.loc[revmgmt_index, account_name_col] = (
+            revmgmt_account_name
+        )
+        stage3_df.loc[other_index, account_name_col] = (
+            other_account_name
+        )
+
+        metric_cols = st.columns(2)
+        metric_cols[0].metric(
+            f"→ {revmgmt_account_name}", f"{len(revmgmt_index):,}"
+        )
+        metric_cols[1].metric(
+            f"→ {other_account_name}", f"{len(other_index):,}"
+        )
+
+        def vendor_breakdown(index):
+            return (
+                vendor_values.loc[index]
+                .replace("", "(blank vendor)")
+                .value_counts()
+                .rename_axis("Vendor (Name)")
+                .reset_index(name="Rows")
+            )
+
+        st.markdown(
+            f"**Swept into {other_account_name}** — check for any "
+            "vendor that should be Revenue Management:"
+        )
+        other_breakdown_df = vendor_breakdown(other_index)
+        st.dataframe(
+            other_breakdown_df,
+            use_container_width=True,
+            hide_index=True,
+            height=min(360, 60 + 35 * len(other_breakdown_df))
+        )
+
+        if len(revmgmt_index) > 0:
+            st.markdown(
+                f"**Mapped to {revmgmt_account_name}:**"
+            )
+            revmgmt_breakdown_df = vendor_breakdown(revmgmt_index)
+            st.dataframe(
+                revmgmt_breakdown_df,
+                use_container_width=True,
+                hide_index=True,
+                height=min(
+                    240, 60 + 35 * len(revmgmt_breakdown_df)
+                )
+            )
 
     st.session_state["stage3_df"] = stage3_df
 
