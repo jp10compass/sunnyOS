@@ -379,7 +379,18 @@ CORPORATE_ACCOUNT_NAMES = [
     "Telephone:Phone",
     "Uncategorized Expense",
     "Reconciliation Discrepancies",
-    "Tax Collection Allowance"
+    "Tax Collection Allowance",
+    "Ad & Marketing:Advertising",
+    "Ad & Marketing:Marketing",
+    "Ad & Marketing:Promo Material",
+    "Ad & Marketing:Website Fees",
+    "Freight & Delivery:Postage",
+    "Insurance:Property-Liabililty Insurance",
+    "Meals",
+    "Payroll Costs:Subcontractor - Non GS",
+    "Recruiting Expense",
+    "Revenue Management",
+    "Travel & Ent:Travel",
 ]
 
 
