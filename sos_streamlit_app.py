@@ -535,6 +535,7 @@ MAINTENANCE_SUB_ACCOUNTS = [
     "Inhouse Repairs",
     "Inventory",
     "Landscape",
+    "Pest Control",
     "Plumbing",
     "Pool",
     "Upholstery",
