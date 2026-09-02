@@ -685,6 +685,128 @@ SOFTWARE_OTHER_ACCOUNT = "Software - Other"
 DEFAULT_SOFTWARE_REVENUE_MANAGEMENT_TERMS = ["revup"]
 
 
+# ============================================================
+# STEP 4: PAYROLL — EMPLOYEE NAME FROM DESCRIPTION
+#
+# Rippling posts these payroll accounts as Journal Entries with
+# no usable Name. The employee name is embedded in the
+# Description, always as:
+#
+#   ... for <NAME>. Payroll run: <run label>
+#
+# Every Journal Entry in one of PAYROLL_NAME_SOURCE_ACCOUNTS gets
+# its Name OVERWRITTEN with the extracted employee name (these
+# are system-generated JEs, so the Description is the source of
+# truth, not any existing Name). Rows where the name can't be
+# read cleanly keep their existing Name and are flagged for
+# review in the UI. Non-JE rows, and rows in any other account,
+# are never touched.
+# ============================================================
+
+PAYROLL_NAME_SOURCE_ACCOUNTS = [
+    "Payroll Costs:Payroll Guest Services",
+    "Payroll Costs:Employee Benefits",
+    "Payroll Costs:Payroll Taxes",
+]
+
+# Same person, two spellings in Rippling's data. Extracted names
+# are resolved through this before being written. Displayed in
+# the UI; edited here in code, not in the app.
+PAYROLL_EMPLOYEE_NAME_ALIASES = {
+    "Salvatore Belloise IV": "Salvatore Belloise",
+}
+
+_PAYROLL_ALIAS_NORMALIZED = {
+    normalize_text(raw_name): resolved_name
+    for raw_name, resolved_name in PAYROLL_EMPLOYEE_NAME_ALIASES.items()
+}
+
+# If the text pulled from the Description contains any of these
+# (whole word, case-insensitive) — or any digit — it is not a
+# person's name. It's a tax/benefit label that leaked through
+# because Rippling worded a line differently than every known
+# example. Flag it for review, never write it.
+PAYROLL_NAME_STOP_WORDS = {
+    "tax", "taxes", "employer", "employee", "unemployment",
+    "medicare", "social", "security", "prsi", "deduction",
+    "deductions", "contribution", "premium", "insurance",
+    "401k", "roth", "fica", "futa", "suta", "withholding",
+    "benefit", "benefits",
+}
+
+PAYROLL_RUN_ANCHOR = re.compile(
+    r"\.\s*payroll run\s*:", re.IGNORECASE
+)
+
+PAYROLL_NAME_STATUS_LABELS = {
+    "blank": "Description is blank",
+    "no_anchor": 'No ". Payroll run:" in the description',
+    "no_for": 'No " for " before "Payroll run:"',
+    "empty": 'Nothing between " for " and "Payroll run:"',
+    "not_a_name": "Reads as a tax/benefit label, not a person",
+}
+
+
+def extract_payroll_employee_name(description):
+    """
+    Pull the employee name from a Rippling payroll JE Description.
+
+    The name always sits between the LAST " for " and the
+    ". Payroll run:" segment:
+
+        <label, may itself contain " for "> for <NAME>. Payroll run: <run label>
+
+    Cutting at ". Payroll run:" first drops the (often messy) run
+    label; the last " for " in what remains is the one right
+    before the name.
+
+    Returns (name, raw, status):
+      - (resolved, raw, "ok")          clean name; raw = text
+                                       before alias resolution
+      - (raw, raw, "not_a_name")       got text, but it looks like
+                                       a tax/benefit label or code
+      - ("", "", "blank" | "no_anchor" | "no_for" | "empty")
+    """
+
+    text = clean_text(description)
+
+    if text == "":
+        return "", "", "blank"
+
+    anchor = PAYROLL_RUN_ANCHOR.search(text)
+
+    if anchor is None:
+        return "", "", "no_anchor"
+
+    head = text[: anchor.start()]
+
+    position = head.lower().rfind(" for ")
+
+    if position == -1:
+        return "", "", "no_for"
+
+    candidate = head[position + len(" for "):].strip(" .,-\t")
+
+    if candidate == "":
+        return "", "", "empty"
+
+    tokens = re.findall(r"[a-z0-9]+", candidate.lower())
+
+    looks_wrong = (
+        any(character.isdigit() for character in candidate)
+        or any(token in PAYROLL_NAME_STOP_WORDS for token in tokens)
+    )
+
+    if looks_wrong:
+        return candidate, candidate, "not_a_name"
+
+    resolved = _PAYROLL_ALIAS_NORMALIZED.get(
+        normalize_text(candidate), candidate
+    )
+
+    return resolved, candidate, "ok"
+
+
 def classify_by_transaction_type(rule, transaction_type, amount):
     """
     Centralized classification for every rule_type ==
@@ -2541,9 +2663,10 @@ if run_clicked:
             # keep operating on stale data.
             for key in list(st.session_state.keys()):
                 if (
-                    key in ("stage2_df", "stage3_df")
+                    key in ("stage2_df", "stage3_df", "stage4_df")
                     or key.startswith("stage2_")
                     or key.startswith("stage3_")
+                    or key.startswith("stage4_")
                     or key.startswith("owner_match_")
                 ):
                     del st.session_state[key]
@@ -2571,6 +2694,7 @@ if "sos_results" in st.session_state:
                     key == "sos_results"
                     or key.startswith("stage2_")
                     or key.startswith("stage3_")
+                    or key.startswith("stage4_")
                     or key.startswith("owner_match_")
                 ):
                     del st.session_state[key]
@@ -3733,3 +3857,375 @@ if "sos_results" in st.session_state:
         file_name=stage3_output_filename,
         mime="text/csv"
     )
+
+    # ========================================================
+    # STEP 4 — PAYROLL EMPLOYEE NAME FROM DESCRIPTION
+    #
+    # For Journal Entries in the three payroll accounts, the
+    # employee name is read from the Description and written into
+    # Name (overwriting whatever is there). Rows that can't be
+    # read cleanly keep their current Name and are listed for
+    # manual entry. See extract_payroll_employee_name().
+    # ========================================================
+
+    st.divider()
+    st.header("👤 Step 4 — Payroll Employee Name from Description")
+    st.caption(
+        "Rippling posts Guest Services, Employee Benefits, and "
+        "Payroll Taxes as journal entries with no usable Name. "
+        "The employee name is read from the Description and "
+        "written into Name. Review anything that couldn't be "
+        "read cleanly."
+    )
+
+    with st.expander("How the name is read"):
+        alias_lines = "\n".join(
+            f"    - `{raw_name}` → **{resolved_name}**"
+            for raw_name, resolved_name
+            in PAYROLL_EMPLOYEE_NAME_ALIASES.items()
+        )
+        st.markdown(
+            "- Scope: **Journal Entry** rows in "
+            + ", ".join(
+                f"`{account}`"
+                for account in PAYROLL_NAME_SOURCE_ACCOUNTS
+            )
+            + ". Nothing else is touched.\n"
+            "- The name is the text between the **last** "
+            '" for " and ". Payroll run:" in the Description.\n'
+            "- Known aliases (same person, two spellings):\n"
+            + alias_lines
+            + "\n- A row is **flagged** — and its current Name "
+            "left alone — when the description is blank, doesn't "
+            "fit the pattern, or the extracted text reads as a "
+            "tax/benefit label instead of a person."
+        )
+
+    if not (name_col and transaction_type_col):
+
+        st.error(
+            "The 'Name' and 'Transaction Type' columns are "
+            "required for Step 4."
+        )
+
+    else:
+
+        stage4_df = stage3_df.copy()
+
+        payroll_account_norms = {
+            normalize_account_name(account)
+            for account in PAYROLL_NAME_SOURCE_ACCOUNTS
+        }
+
+        account_norm_series = stage4_df[account_name_col].map(
+            normalize_account_name
+        )
+        type_norm_series = stage4_df[transaction_type_col].map(
+            normalize_text
+        )
+
+        in_scope_mask = (
+            account_norm_series.isin(payroll_account_norms)
+            & type_norm_series.eq("journal entry")
+        )
+        in_scope_index = list(stage4_df.loc[in_scope_mask].index)
+
+        extraction = {
+            row_index: extract_payroll_employee_name(
+                stage4_df.loc[row_index, description_col]
+            )
+            for row_index in in_scope_index
+        }
+
+        if "stage4_manual_names" not in st.session_state:
+            st.session_state["stage4_manual_names"] = {}
+
+        manual_names = st.session_state["stage4_manual_names"]
+
+        def manual_name_for(row_index):
+            return clean_text(manual_names.get(row_index, ""))
+
+        # Auto-extracted clean names, then manual entries on top.
+        for row_index, (name_value, _raw, status) in (
+            extraction.items()
+        ):
+            if status == "ok":
+                stage4_df.loc[row_index, name_col] = name_value
+
+        for row_index in in_scope_index:
+            manual_value = manual_name_for(row_index)
+            if manual_value != "":
+                stage4_df.loc[row_index, name_col] = manual_value
+
+        def is_resolved(row_index):
+            return (
+                extraction[row_index][2] == "ok"
+                or manual_name_for(row_index) != ""
+            )
+
+        needs_review_index = [
+            row_index
+            for row_index in in_scope_index
+            if not is_resolved(row_index)
+        ]
+
+        auto_count = sum(
+            1 for row_index in in_scope_index
+            if extraction[row_index][2] == "ok"
+        )
+        manual_count = sum(
+            1 for row_index in in_scope_index
+            if extraction[row_index][2] != "ok"
+            and manual_name_for(row_index) != ""
+        )
+        filled_count = auto_count + manual_count
+
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Payroll JE rows", f"{len(in_scope_index):,}")
+        c2.metric("Name filled", f"{filled_count:,}")
+        c3.metric(
+            "Needs your review", f"{len(needs_review_index):,}"
+        )
+
+        if not in_scope_index:
+
+            st.info(
+                "No payroll journal-entry rows in this file — "
+                "nothing to do here."
+            )
+
+        else:
+
+            st.markdown(
+                f"**Filled Name on {filled_count} of "
+                f"{len(in_scope_index)} payroll journal-entry "
+                "rows.**"
+            )
+
+            per_account_rows = []
+
+            for account in PAYROLL_NAME_SOURCE_ACCOUNTS:
+
+                account_norm = normalize_account_name(account)
+                account_index = [
+                    row_index for row_index in in_scope_index
+                    if account_norm_series[row_index] == account_norm
+                ]
+
+                if not account_index:
+                    continue
+
+                resolved_here = sum(
+                    1 for row_index in account_index
+                    if is_resolved(row_index)
+                )
+
+                per_account_rows.append({
+                    "Account": account,
+                    "JE rows": len(account_index),
+                    "Name filled": resolved_here,
+                    "Needs review": (
+                        len(account_index) - resolved_here
+                    ),
+                })
+
+            st.dataframe(
+                pd.DataFrame(per_account_rows),
+                use_container_width=True,
+                hide_index=True
+            )
+
+            # ------------------------------------------------
+            # Names written — always shown, read-only. This is
+            # the sanity check: anything here that isn't a
+            # person is a bad parse.
+            # ------------------------------------------------
+
+            name_aggregate = {}
+            aliased_names = set()
+
+            for row_index in in_scope_index:
+
+                name_value, raw_value, status = extraction[row_index]
+                manual_value = manual_name_for(row_index)
+
+                if manual_value != "":
+                    final_name = manual_value
+                elif status == "ok":
+                    final_name = name_value
+                    if (
+                        normalize_text(raw_value)
+                        in _PAYROLL_ALIAS_NORMALIZED
+                    ):
+                        aliased_names.add(final_name)
+                else:
+                    continue
+
+                entry = name_aggregate.setdefault(
+                    final_name,
+                    {"rows": 0, "accounts": set()}
+                )
+                entry["rows"] += 1
+                entry["accounts"].add(
+                    stage4_df.loc[row_index, account_name_col]
+                )
+
+            st.markdown("#### Names written")
+
+            if name_aggregate:
+
+                names_written_df = pd.DataFrame(
+                    [
+                        {
+                            "Employee": (
+                                f"{employee_name}  ·  incl. alias"
+                                if employee_name in aliased_names
+                                else employee_name
+                            ),
+                            "Rows": entry["rows"],
+                            "Accounts": ", ".join(
+                                sorted(
+                                    account.split(":")[-1]
+                                    for account in entry["accounts"]
+                                )
+                            ),
+                        }
+                        for employee_name, entry
+                        in sorted(
+                            name_aggregate.items(),
+                            key=lambda item: (
+                                -item[1]["rows"], item[0]
+                            )
+                        )
+                    ]
+                )
+
+                st.dataframe(
+                    names_written_df,
+                    use_container_width=True,
+                    hide_index=True,
+                    height=min(
+                        360, 60 + 35 * len(names_written_df)
+                    )
+                )
+                st.caption(
+                    "Every name written to the Name column. Scan "
+                    "for anything that isn't a person."
+                )
+
+            else:
+                st.caption("No names written yet.")
+
+            # ------------------------------------------------
+            # Needs your review — flagged rows, manual entry.
+            # ------------------------------------------------
+
+            if needs_review_index:
+
+                st.markdown("#### Needs your review")
+                st.caption(
+                    "The name couldn't be read cleanly from "
+                    "these descriptions. Type the correct Name, "
+                    "or leave it blank to keep the row's current "
+                    "Name."
+                )
+
+                review_df = pd.DataFrame(
+                    [
+                        {
+                            "Transaction date": stage4_df.loc[
+                                row_index, transaction_date_col
+                            ],
+                            "Account": stage4_df.loc[
+                                row_index, account_name_col
+                            ],
+                            "Num": stage4_df.loc[
+                                row_index, results["num_column"]
+                            ],
+                            "Description": stage4_df.loc[
+                                row_index, description_col
+                            ],
+                            "Amount": stage4_df.loc[
+                                row_index, amount_col
+                            ],
+                            "Reason": PAYROLL_NAME_STATUS_LABELS.get(
+                                extraction[row_index][2],
+                                extraction[row_index][2]
+                            ),
+                            "Extracted text": (
+                                extraction[row_index][1]
+                            ),
+                            "Name": manual_names.get(row_index, ""),
+                        }
+                        for row_index in needs_review_index
+                    ],
+                    index=needs_review_index
+                )
+
+                edited_review_df = st.data_editor(
+                    review_df,
+                    column_config={
+                        "Name": st.column_config.TextColumn(
+                            "Name (your entry)",
+                            help=(
+                                "Leave blank to keep the row's "
+                                "current Name."
+                            )
+                        )
+                    },
+                    disabled=[
+                        "Transaction date", "Account", "Num",
+                        "Description", "Amount", "Reason",
+                        "Extracted text"
+                    ],
+                    hide_index=True,
+                    use_container_width=True,
+                    key="stage4_review_editor"
+                )
+
+                if st.button(
+                    "Apply names",
+                    type="primary",
+                    key="stage4_apply_button"
+                ):
+                    for row_index, entered_name in zip(
+                        needs_review_index,
+                        edited_review_df["Name"].values
+                    ):
+                        cleaned_name = clean_text(entered_name)
+                        if cleaned_name != "":
+                            manual_names[row_index] = cleaned_name
+                        else:
+                            manual_names.pop(row_index, None)
+
+                    st.session_state["stage4_manual_names"] = (
+                        manual_names
+                    )
+                    st.rerun()
+
+            else:
+                st.success(
+                    "Every payroll journal-entry row has a Name."
+                )
+
+        st.session_state["stage4_df"] = stage4_df
+
+        st.subheader("Step 4 output")
+        st.dataframe(
+            stage4_df,
+            use_container_width=True,
+            height=380
+        )
+
+        stage4_output_filename = results["output_filename"].replace(
+            "_mapped.csv", "_final.csv"
+        )
+
+        st.download_button(
+            "⬇️ Download final CSV",
+            data=stage4_df.to_csv(
+                index=False
+            ).encode("utf-8-sig"),
+            file_name=stage4_output_filename,
+            mime="text/csv"
+        )
