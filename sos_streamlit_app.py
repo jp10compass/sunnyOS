@@ -413,12 +413,23 @@ CORPORATE_ACCOUNT_NAMES = [
 # Name" field (blank-safe, trimmed, case-insensitive — see
 # normalize_account_name()) against "source_account" exactly.
 #
-# rule_type == "name_based":
+# rule_type == "name_based" (currently unused — kept for reuse):
 #   Classification comes from the "Name" column.
 #   - Name matches one of "cost_name_values"  -> Cost
 #   - Name is nonblank and does not match      -> Income
 #   - Name is blank                            -> the user is
 #     asked to tag the row as Income or Cost
+#
+# rule_type == "name_and_transaction_type_based" (Credit Card
+# Clearing):
+#   - Transaction Type in "sign_based_types" -> Amount sign
+#     decides (negative -> Cost, zero or positive -> Income;
+#     unparseable Amount -> unclassified).
+#   - Transaction Type in "cost_types" -> Cost only when the Name
+#     matches one of "cost_name_values"; a blank or any other
+#     Name is left unclassified (goes to the manual Income/Cost
+#     editor, since allow_manual_tagging is True).
+#   - Every other Transaction Type -> Income.
 #
 # rule_type == "transaction_type_based":
 #   Classification comes from the single centralized
@@ -447,13 +458,24 @@ CORPORATE_ACCOUNT_NAMES = [
 # classification function.
 # ============================================================
 
+# NOTE: "deposit" -> Cost needs a closer look with the bookkeeper.
+# A Deposit in a clearing account can go either way (funds coming
+# in vs. a payout being staged), and both positive AND negative
+# Deposits appear in the data, so this fixed mapping is not as
+# solid as the others. Volume is very low, so it is worth
+# reviewing each one with the bookkeeper rather than trusting the
+# rule. Left as Cost for now — revisit before relying on it.
+# Deposits also appear in CAM Clearing, where CAM_TRANSACTION_TYPE
+# _MAP has no "deposit" key, so those are currently left
+# unclassified and flagged for review (not auto-tagged Cost).
 HOUSEKEEPING_TRANSACTION_TYPE_MAP = {
     "bill": "Cost",
     "credit memo": "Income",
     "deposit": "Cost",
+    "expense": "Cost",
     "refund": "Income",
     "revenue recognition": "Income",
-    "vendor credit": "Income",
+    "vendor credit": "Cost",
 }
 
 # OTA / booking-channel commission account. Unrelated to
@@ -472,7 +494,7 @@ HOA_TRANSACTION_TYPE_MAP = {
     "credit memo": "Income",
     "refund": "Income",
     "revenue recognition": "Income",
-    "vendor credit": "Income",
+    "vendor credit": "Cost",
 }
 
 TRAVEL_INSURANCE_TRANSACTION_TYPE_MAP = {
@@ -485,26 +507,24 @@ CAM_TRANSACTION_TYPE_MAP = {
     "credit memo": "Income",
     "refund": "Income",
     "revenue recognition": "Income",
+    "bill": "Cost",
     "expense": "Cost",
 }
 
-# Bill -> Income and Vendor Credit -> Income are PROVISIONAL,
-# pending bookkeeper confirmation — everywhere else in this
-# file, Bill and Vendor Credit map to Cost/Income respectively
-# for the *other* Pass Thru accounts, so double-check before
-# reusing this table as a template.
 LOCK_FEE_TRANSACTION_TYPE_MAP = {
     "revenue recognition": "Income",
     "refund": "Income",
     "credit memo": "Income",
-    "bill": "Income",
-    "vendor credit": "Income",
+    "bill": "Cost",
+    "vendor credit": "Cost",
     "expense": "Cost",
 }
 
 APP_FEE_TRANSACTION_TYPE_MAP = {
     "revenue recognition": "Income",
     "credit memo": "Income",
+    "refund": "Income",
+    "bill": "Cost",
     "expense": "Cost",
 }
 
@@ -546,8 +566,15 @@ ACCOUNT_SPLIT_RULES = [
         "source_account": "Pass Thru Income:Credit Card Clearing",
         "income_label": "Credit Card Income",
         "cost_label": "Credit Card Cost",
-        "rule_type": "name_based",
+        "rule_type": "name_and_transaction_type_based",
+        # Bill / Expense: Cost only when the Name is a listed
+        # cost vendor; a blank or any other Name is left for the
+        # manual Income/Cost editor. Journal Entry: sign-based
+        # (negative -> Cost, zero or positive -> Income). Every
+        # other Transaction Type -> Income.
+        "cost_types": {"bill", "expense"},
         "cost_name_values": {"Lynnbrook Merchant Services"},
+        "sign_based_types": {"journal entry"},
         "allow_manual_tagging": True,
     },
     {
@@ -627,9 +654,7 @@ ACCOUNT_SPLIT_RULES = [
         "transaction_type_map": LOCK_FEE_TRANSACTION_TYPE_MAP,
         # Amount sign is never used for this account — negative
         # Refunds/Credit Memos stay Income, and a zero-value row
-        # still classifies by its Transaction Type. Bill and
-        # Vendor Credit -> Income are provisional — see the map
-        # definition above.
+        # still classifies by its Transaction Type.
         "sign_based_types": set(),
     },
     {
@@ -922,6 +947,31 @@ def classify_row_for_rule(
 
         if normalize_text(name_value) in cost_values:
             return "Cost"
+
+        return "Income"
+
+    if rule["rule_type"] == "name_and_transaction_type_based":
+
+        normalized_type = normalize_text(row[transaction_type_col])
+
+        if normalized_type in rule.get("sign_based_types", set()):
+            amount = parse_amount(row[amount_col])
+            if amount is None:
+                return ""
+            return "Cost" if amount < 0 else "Income"
+
+        if normalized_type in rule["cost_types"]:
+            name_value = clean_text(row[name_col])
+            cost_values = {
+                normalize_text(value)
+                for value in rule["cost_name_values"]
+            }
+            if (
+                name_value != ""
+                and normalize_text(name_value) in cost_values
+            ):
+                return "Cost"
+            return ""
 
         return "Income"
 
@@ -3309,10 +3359,10 @@ if "sos_results" in st.session_state:
     # See ACCOUNT_SPLIT_RULES for the account list and rules.
     #
     # Every rule is auto-applied the moment this step loads —
-    # they're lookups, not decisions. The one exception is a
-    # blank "Name" on Credit Card Clearing, which genuinely
-    # needs a human call; that's the only thing you're ever
-    # asked to do here.
+    # they're lookups, not decisions. The one exception is
+    # Credit Card Clearing: a Bill or Expense whose Name is blank
+    # or isn't a listed cost vendor needs a human Income/Cost
+    # call; that's the only thing you're ever asked to do here.
     # ========================================================
 
     st.divider()
@@ -3496,13 +3546,15 @@ if "sos_results" in st.session_state:
 
                     st.markdown(
                         f"**{manual_rule['source_account']}** "
-                        f"— {needs_input_count} row(s) with a "
-                        "blank Name. Tag each one as Income or "
-                        "Cost:"
+                        f"— {needs_input_count} row(s) that need "
+                        "a manual Income/Cost call (blank or "
+                        "unrecognized Name on a Bill/Expense). "
+                        "Tag each one:"
                     )
 
                     preview_columns = [
                         transaction_date_col,
+                        transaction_type_col,
                         name_col,
                         description_col,
                         amount_col,
