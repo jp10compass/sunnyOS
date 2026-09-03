@@ -694,13 +694,20 @@ DEFAULT_SOFTWARE_REVENUE_MANAGEMENT_TERMS = ["revup"]
 #
 #   ... for <NAME>. Payroll run: <run label>
 #
-# Every Journal Entry in one of PAYROLL_NAME_SOURCE_ACCOUNTS gets
-# its Name OVERWRITTEN with the extracted employee name (these
-# are system-generated JEs, so the Description is the source of
-# truth, not any existing Name). Rows where the name can't be
-# read cleanly keep their existing Name and are flagged for
-# review in the UI. Non-JE rows, and rows in any other account,
-# are never touched.
+# Two account groups:
+#
+#   PAYROLL_NAME_SOURCE_ACCOUNTS            — every JE row has its
+#     Name OVERWRITTEN with the extracted name (system-generated
+#     JEs, so the Description is the source of truth).
+#
+#   PAYROLL_NAME_SOURCE_ACCOUNTS_BLANK_ONLY — only JE rows whose
+#     Name is blank are touched; a row that already has a Name is
+#     left alone. Extracted names are additionally run through an
+#     editable per-account remap (DEFAULT_SUBCONTRACTOR_NAME_REMAP).
+#
+# Rows where the name can't be read cleanly keep their existing
+# Name and are flagged for review in the UI. Non-JE rows, and
+# rows in any other account, are never touched.
 # ============================================================
 
 PAYROLL_NAME_SOURCE_ACCOUNTS = [
@@ -708,6 +715,19 @@ PAYROLL_NAME_SOURCE_ACCOUNTS = [
     "Payroll Costs:Employee Benefits",
     "Payroll Costs:Payroll Taxes",
 ]
+
+PAYROLL_NAME_SOURCE_ACCOUNTS_BLANK_ONLY = [
+    "Payroll Costs:Subcontractor Guest Services",
+]
+
+# Applied ONLY to the blank-only accounts above: the name read
+# from the Description (left) and the name actually written
+# (right). Seeds an editable table in the app — a name not listed
+# is written exactly as extracted.
+DEFAULT_SUBCONTRACTOR_NAME_REMAP = {
+    "Vincent A Bedami": "Vincent Bedami",
+    "Lisa Marie Willis": "Lisa Willis",
+}
 
 # Same person, two spellings in Rippling's data. Extracted names
 # are resolved through this before being written. Displayed in
@@ -3861,21 +3881,23 @@ if "sos_results" in st.session_state:
     # ========================================================
     # STEP 4 — PAYROLL EMPLOYEE NAME FROM DESCRIPTION
     #
-    # For Journal Entries in the three payroll accounts, the
-    # employee name is read from the Description and written into
-    # Name (overwriting whatever is there). Rows that can't be
-    # read cleanly keep their current Name and are listed for
-    # manual entry. See extract_payroll_employee_name().
+    # Group A accounts: every Journal Entry row's Name is
+    # OVERWRITTEN with the name read from the Description.
+    # Group B accounts (blank-only): only JE rows with a blank
+    # Name are touched, and the extracted name passes through an
+    # editable per-account remap first.
+    # Rows that can't be read cleanly keep their current Name and
+    # are listed for manual entry. See
+    # extract_payroll_employee_name().
     # ========================================================
 
     st.divider()
     st.header("👤 Step 4 — Payroll Employee Name from Description")
     st.caption(
-        "Rippling posts Guest Services, Employee Benefits, and "
-        "Payroll Taxes as journal entries with no usable Name. "
-        "The employee name is read from the Description and "
-        "written into Name. Review anything that couldn't be "
-        "read cleanly."
+        "Rippling posts payroll accounts as journal entries with "
+        "no usable Name. The employee name is read from the "
+        "Description and written into Name. Review anything that "
+        "couldn't be read cleanly."
     )
 
     with st.expander("How the name is read"):
@@ -3885,12 +3907,19 @@ if "sos_results" in st.session_state:
             in PAYROLL_EMPLOYEE_NAME_ALIASES.items()
         )
         st.markdown(
-            "- Scope: **Journal Entry** rows in "
+            "- **Overwrite** — every Journal Entry row in: "
             + ", ".join(
                 f"`{account}`"
                 for account in PAYROLL_NAME_SOURCE_ACCOUNTS
             )
-            + ". Nothing else is touched.\n"
+            + "\n- **Only when Name is blank** — JE rows in: "
+            + ", ".join(
+                f"`{account}`"
+                for account
+                in PAYROLL_NAME_SOURCE_ACCOUNTS_BLANK_ONLY
+            )
+            + " (extracted name also passes through the editable "
+            "remap below)\n"
             "- The name is the text between the **last** "
             '" for " and ". Payroll run:" in the Description.\n'
             "- Known aliases (same person, two spellings):\n"
@@ -3912,9 +3941,13 @@ if "sos_results" in st.session_state:
 
         stage4_df = stage3_df.copy()
 
-        payroll_account_norms = {
+        group_a_norms = {
             normalize_account_name(account)
             for account in PAYROLL_NAME_SOURCE_ACCOUNTS
+        }
+        group_b_norms = {
+            normalize_account_name(account)
+            for account in PAYROLL_NAME_SOURCE_ACCOUNTS_BLANK_ONLY
         }
 
         account_norm_series = stage4_df[account_name_col].map(
@@ -3923,12 +3956,23 @@ if "sos_results" in st.session_state:
         type_norm_series = stage4_df[transaction_type_col].map(
             normalize_text
         )
+        is_je_series = type_norm_series.eq("journal entry")
+        name_blank_series = (
+            stage4_df[name_col].map(clean_text).eq("")
+        )
 
         in_scope_mask = (
-            account_norm_series.isin(payroll_account_norms)
-            & type_norm_series.eq("journal entry")
+            (account_norm_series.isin(group_a_norms) & is_je_series)
+            | (
+                account_norm_series.isin(group_b_norms)
+                & is_je_series
+                & name_blank_series
+            )
         )
         in_scope_index = list(stage4_df.loc[in_scope_mask].index)
+
+        def is_group_b(row_index):
+            return account_norm_series[row_index] in group_b_norms
 
         extraction = {
             row_index: extract_payroll_employee_name(
@@ -3939,46 +3983,74 @@ if "sos_results" in st.session_state:
 
         if "stage4_manual_names" not in st.session_state:
             st.session_state["stage4_manual_names"] = {}
+        if "stage4_subcontractor_remap" not in st.session_state:
+            st.session_state["stage4_subcontractor_remap"] = dict(
+                DEFAULT_SUBCONTRACTOR_NAME_REMAP
+            )
 
         manual_names = st.session_state["stage4_manual_names"]
+        subcontractor_remap = st.session_state[
+            "stage4_subcontractor_remap"
+        ]
+        subcontractor_remap_norm = {
+            normalize_text(extracted_name): written_name
+            for extracted_name, written_name
+            in subcontractor_remap.items()
+        }
 
         def manual_name_for(row_index):
             return clean_text(manual_names.get(row_index, ""))
 
-        # Auto-extracted clean names, then manual entries on top.
-        for row_index, (name_value, _raw, status) in (
-            extraction.items()
-        ):
-            if status == "ok":
-                stage4_df.loc[row_index, name_col] = name_value
+        # Single source of truth: the name written into each
+        # in-scope row. Manual entry wins; then a clean
+        # extraction (alias-resolved, and remapped for group B).
+        written_name_by_index = {}
+        manual_index = set()
+        marked_row_index = set()
 
         for row_index in in_scope_index:
-            manual_value = manual_name_for(row_index)
-            if manual_value != "":
-                stage4_df.loc[row_index, name_col] = manual_value
 
-        def is_resolved(row_index):
-            return (
-                extraction[row_index][2] == "ok"
-                or manual_name_for(row_index) != ""
-            )
+            name_value, raw_value, status = extraction[row_index]
+            manual_value = manual_name_for(row_index)
+
+            if manual_value != "":
+                written_name_by_index[row_index] = manual_value
+                manual_index.add(row_index)
+                continue
+
+            if status != "ok":
+                continue
+
+            if is_group_b(row_index):
+                final_name = subcontractor_remap_norm.get(
+                    normalize_text(raw_value), name_value
+                )
+                if final_name != name_value:
+                    marked_row_index.add(row_index)
+            else:
+                final_name = name_value
+                if (
+                    normalize_text(raw_value)
+                    in _PAYROLL_ALIAS_NORMALIZED
+                ):
+                    marked_row_index.add(row_index)
+
+            written_name_by_index[row_index] = final_name
+
+        for row_index, written_name in (
+            written_name_by_index.items()
+        ):
+            stage4_df.loc[row_index, name_col] = written_name
 
         needs_review_index = [
             row_index
             for row_index in in_scope_index
-            if not is_resolved(row_index)
+            if row_index not in written_name_by_index
         ]
 
-        auto_count = sum(
-            1 for row_index in in_scope_index
-            if extraction[row_index][2] == "ok"
-        )
-        manual_count = sum(
-            1 for row_index in in_scope_index
-            if extraction[row_index][2] != "ok"
-            and manual_name_for(row_index) != ""
-        )
-        filled_count = auto_count + manual_count
+        manual_count = len(manual_index)
+        auto_count = len(written_name_by_index) - manual_count
+        filled_count = len(written_name_by_index)
 
         c1, c2, c3 = st.columns(3)
         c1.metric("Payroll JE rows", f"{len(in_scope_index):,}")
@@ -4004,7 +4076,10 @@ if "sos_results" in st.session_state:
 
             per_account_rows = []
 
-            for account in PAYROLL_NAME_SOURCE_ACCOUNTS:
+            for account in (
+                PAYROLL_NAME_SOURCE_ACCOUNTS
+                + PAYROLL_NAME_SOURCE_ACCOUNTS_BLANK_ONLY
+            ):
 
                 account_norm = normalize_account_name(account)
                 account_index = [
@@ -4017,7 +4092,7 @@ if "sos_results" in st.session_state:
 
                 resolved_here = sum(
                     1 for row_index in account_index
-                    if is_resolved(row_index)
+                    if row_index in written_name_by_index
                 )
 
                 per_account_rows.append({
@@ -4036,39 +4111,109 @@ if "sos_results" in st.session_state:
             )
 
             # ------------------------------------------------
+            # Subcontractor name remap — editable. Shown only
+            # when the blank-only account has rows in the file.
+            # ------------------------------------------------
+
+            group_b_ok_index = [
+                row_index for row_index in in_scope_index
+                if is_group_b(row_index)
+                and extraction[row_index][2] == "ok"
+            ]
+
+            if group_b_ok_index:
+
+                extracted_counts = {}
+                for row_index in group_b_ok_index:
+                    raw_value = extraction[row_index][1]
+                    extracted_counts[raw_value] = (
+                        extracted_counts.get(raw_value, 0) + 1
+                    )
+
+                remap_editor_df = pd.DataFrame(
+                    [
+                        {
+                            "Extracted name": extracted_name,
+                            "Write as": subcontractor_remap.get(
+                                extracted_name, extracted_name
+                            ),
+                            "Rows": count,
+                        }
+                        for extracted_name, count
+                        in sorted(extracted_counts.items())
+                    ]
+                )
+
+                st.markdown("#### Subcontractor name remap")
+                st.caption(
+                    "Names read from "
+                    + ", ".join(
+                        account.split(":")[-1]
+                        for account
+                        in PAYROLL_NAME_SOURCE_ACCOUNTS_BLANK_ONLY
+                    )
+                    + " descriptions, and what gets written into "
+                    "Name. Edit the “Write as” column; "
+                    "clear it to write the name exactly as "
+                    "extracted."
+                )
+
+                edited_remap_df = st.data_editor(
+                    remap_editor_df,
+                    column_config={
+                        "Write as": st.column_config.TextColumn(
+                            "Write as"
+                        )
+                    },
+                    disabled=["Extracted name", "Rows"],
+                    hide_index=True,
+                    use_container_width=True,
+                    key="stage4_subcontractor_remap_editor"
+                )
+
+                updated_remap = dict(subcontractor_remap)
+                for _, remap_row in edited_remap_df.iterrows():
+                    extracted_name = clean_text(
+                        remap_row["Extracted name"]
+                    )
+                    written_as = clean_text(remap_row["Write as"])
+                    if extracted_name == "":
+                        continue
+                    if written_as in ("", extracted_name):
+                        updated_remap.pop(extracted_name, None)
+                    else:
+                        updated_remap[extracted_name] = written_as
+
+                if updated_remap != subcontractor_remap:
+                    st.session_state[
+                        "stage4_subcontractor_remap"
+                    ] = updated_remap
+                    st.rerun()
+
+            # ------------------------------------------------
             # Names written — always shown, read-only. This is
             # the sanity check: anything here that isn't a
             # person is a bad parse.
             # ------------------------------------------------
 
             name_aggregate = {}
-            aliased_names = set()
 
-            for row_index in in_scope_index:
-
-                name_value, raw_value, status = extraction[row_index]
-                manual_value = manual_name_for(row_index)
-
-                if manual_value != "":
-                    final_name = manual_value
-                elif status == "ok":
-                    final_name = name_value
-                    if (
-                        normalize_text(raw_value)
-                        in _PAYROLL_ALIAS_NORMALIZED
-                    ):
-                        aliased_names.add(final_name)
-                else:
-                    continue
-
+            for row_index, written_name in (
+                written_name_by_index.items()
+            ):
                 entry = name_aggregate.setdefault(
-                    final_name,
+                    written_name,
                     {"rows": 0, "accounts": set()}
                 )
                 entry["rows"] += 1
                 entry["accounts"].add(
                     stage4_df.loc[row_index, account_name_col]
                 )
+
+            marked_names = {
+                written_name_by_index[row_index]
+                for row_index in marked_row_index
+            }
 
             st.markdown("#### Names written")
 
@@ -4077,10 +4222,10 @@ if "sos_results" in st.session_state:
                 names_written_df = pd.DataFrame(
                     [
                         {
-                            "Employee": (
-                                f"{employee_name}  ·  incl. alias"
-                                if employee_name in aliased_names
-                                else employee_name
+                            "Name written": (
+                                f"{written_name}  ·  remapped"
+                                if written_name in marked_names
+                                else written_name
                             ),
                             "Rows": entry["rows"],
                             "Accounts": ", ".join(
@@ -4090,7 +4235,7 @@ if "sos_results" in st.session_state:
                                 )
                             ),
                         }
-                        for employee_name, entry
+                        for written_name, entry
                         in sorted(
                             name_aggregate.items(),
                             key=lambda item: (
