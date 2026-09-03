@@ -3339,6 +3339,26 @@ if "sos_results" in st.session_state:
                         owner_match_df
                     )
 
+                    # Steps 2-4 snapshot their input from the step
+                    # above, and Step 2 caches its dataframe — so
+                    # owner matches applied here never reach them
+                    # (or any export) unless we force a rebuild.
+                    # Same idea as the reset in the "Run
+                    # processing" handler. Step 3/4 settings
+                    # (Revenue Management terms, payroll names)
+                    # live in their own session keys and are left
+                    # intact; only Step 2's manual Credit Card
+                    # Clearing tags are dropped, and owner matching
+                    # is meant to be finished before that work.
+                    for stale_key in (
+                        "stage2_df",
+                        "stage2_auto_applied",
+                        "stage2_editor_manual",
+                        "stage3_df",
+                        "stage4_df",
+                    ):
+                        st.session_state.pop(stale_key, None)
+
                     resolved_count = (
                         len(confirmed_single_index)
                         + len(confirmed_multi)
