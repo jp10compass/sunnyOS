@@ -685,6 +685,51 @@ ACCOUNT_SPLIT_RULES = [
 
 
 # ============================================================
+# STEP 2 (cont.): PAYROLL COSTS — CLASSIFICATION FROM DESCRIPTION
+#
+# Every row in the accounts below gets a "Classification" tag
+# read from its Description (case-insensitive), checked in order:
+#
+#   1. "EOR" with no letter directly before or after it
+#      (matches "Eor Billin", "EOR_BILLIN"; skips "George",
+#      "Theory")                            -> EOR
+#   2. "CHECKR" anywhere                    -> Background Check
+#   3. everything else, blank included      -> Rippling Platform
+#
+# Only "Classification" is written — "Adjusted Amount" stays
+# equal to the original Amount.
+# ============================================================
+
+PAYROLL_CLASSIFICATION_ACCOUNTS = [
+    "Payroll Costs",
+    "Payroll Costs:Payroll Fees",
+]
+
+PAYROLL_EOR_PATTERN = re.compile(r"(?<![a-z])eor(?![a-z])")
+
+PAYROLL_EOR_LABEL = "EOR"
+PAYROLL_BACKGROUND_CHECK_LABEL = "Background Check"
+PAYROLL_PLATFORM_LABEL = "Rippling Platform"
+
+
+def classify_payroll_description(description):
+    """
+    Classification for a Payroll Costs / Payroll Fees row, read
+    from its Description. See PAYROLL_CLASSIFICATION_ACCOUNTS.
+    """
+
+    normalized_description = normalize_text(description)
+
+    if PAYROLL_EOR_PATTERN.search(normalized_description):
+        return PAYROLL_EOR_LABEL
+
+    if "checkr" in normalized_description:
+        return PAYROLL_BACKGROUND_CHECK_LABEL
+
+    return PAYROLL_PLATFORM_LABEL
+
+
+# ============================================================
 # STEP 3: SOFTWARE ACCOUNT VENDOR REMAPPING
 #
 # Every row coded to the "Software" account gets its Account
@@ -3460,6 +3505,17 @@ if "sos_results" in st.session_state:
                 apply_rule_classification(
                     stage2_df, rule, matched_index,
                     final_classification, amount_col
+                )
+
+            for payroll_account in PAYROLL_CLASSIFICATION_ACCOUNTS:
+
+                payroll_mask = get_account_match_mask(
+                    stage2_df, account_name_col, payroll_account
+                )
+
+                stage2_df.loc[payroll_mask, "Classification"] = (
+                    stage2_df.loc[payroll_mask, description_col]
+                    .map(classify_payroll_description)
                 )
 
             st.session_state["stage2_df"] = stage2_df
