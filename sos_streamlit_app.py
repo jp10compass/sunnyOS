@@ -374,6 +374,7 @@ CORPORATE_ACCOUNT_NAMES = [
     "Payroll Costs:Payroll Guest Services",
     "Payroll Costs:Payroll Taxes",
     "Payroll Costs:Subcontractor Guest Services",
+    "Payroll Costs:Workers Compensation",
     "Rent",
     "Software",
     "Telephone:Phone",
@@ -561,6 +562,14 @@ MAINTENANCE_SUB_ACCOUNTS = [
     "Upholstery",
 ]
 
+# Sub-accounts whose QuickBooks account name no longer follows
+# "Maintenance:<sub-account>". The Classification labels still
+# use the sub-account name above, so they stay the same after a
+# rename.
+MAINTENANCE_SOURCE_ACCOUNT_OVERRIDES = {
+    "Inventory": "Maintenance:Inventory - Owner",
+}
+
 ACCOUNT_SPLIT_RULES = [
     {
         "source_account": "Pass Thru Income:Credit Card Clearing",
@@ -671,7 +680,9 @@ ACCOUNT_SPLIT_RULES = [
     },
 ] + [
     {
-        "source_account": f"Maintenance:{sub_account}",
+        "source_account": MAINTENANCE_SOURCE_ACCOUNT_OVERRIDES.get(
+            sub_account, f"Maintenance:{sub_account}"
+        ),
         "income_label": f"Maintenance - {sub_account} Billback",
         "cost_label": f"Maintenance - {sub_account} Cost",
         "rule_type": "transaction_type_based",
@@ -2947,6 +2958,15 @@ if "sos_results" in st.session_state:
         "each one."
     )
 
+    # Set by "Apply confirmed matches" just before its rerun, so
+    # the result survives the rerun and is shown once here.
+    owner_match_success_message = st.session_state.pop(
+        "owner_match_success_message", None
+    )
+
+    if owner_match_success_message:
+        st.success(owner_match_success_message)
+
     if "owner_match_df" not in st.session_state:
         st.session_state["owner_match_df"] = (
             results["processed_df"].copy()
@@ -3175,7 +3195,12 @@ if "sos_results" in st.session_state:
                         ] += 1
                         st.rerun()
 
-                    select_all_active = st.session_state.pop(
+                    # Kept (not popped) until Apply clears it — the
+                    # editor only remembers the user's own clicks,
+                    # so the pre-ticked boxes must be rebuilt the
+                    # same way on every rerun, including the one
+                    # triggered by clicking Apply.
+                    select_all_active = st.session_state.get(
                         "owner_match_single_select_all", False
                     )
 
@@ -3325,7 +3350,11 @@ if "sos_results" in st.session_state:
                             use_container_width=True,
                             key=(
                                 "owner_match_multi_editor_"
-                                f"{group_key_suffix}"
+                                f"{group_key_suffix}_"
+                                + str(st.session_state.get(
+                                    "owner_match_multi_editor_version",
+                                    0
+                                ))
                             )
                         )
 
@@ -3404,11 +3433,29 @@ if "sos_results" in st.session_state:
                     ):
                         st.session_state.pop(stale_key, None)
 
+                    # Fresh editors after Apply: they remember edits
+                    # by row position, so leftover ticks/choices
+                    # would land on different transactions once
+                    # the applied rows drop out of the tables.
+                    st.session_state.pop(
+                        "owner_match_single_select_all", None
+                    )
+                    st.session_state[
+                        "owner_match_single_editor_version"
+                    ] = st.session_state.get(
+                        "owner_match_single_editor_version", 0
+                    ) + 1
+                    st.session_state[
+                        "owner_match_multi_editor_version"
+                    ] = st.session_state.get(
+                        "owner_match_multi_editor_version", 0
+                    ) + 1
+
                     resolved_count = (
                         len(confirmed_single_index)
                         + len(confirmed_multi)
                     )
-                    st.success(
+                    st.session_state["owner_match_success_message"] = (
                         f"{resolved_count} row(s) resolved to a "
                         "Property. Everything else left as "
                         "Unknown."
