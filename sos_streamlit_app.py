@@ -741,29 +741,174 @@ def classify_payroll_description(description):
 
 
 # ============================================================
-# STEP 3: SOFTWARE ACCOUNT VENDOR REMAPPING
+# STEP 3: VENDOR REMAPPING
 #
-# Every row coded to the "Software" account gets its Account
-# Name overwritten with one of two targets:
+# Cleans up inconsistent vendor names (and, for a few vendors,
+# moves the row to a different account) within specific
+# accounts. Each rule only looks at rows whose Account Name —
+# as it was BEFORE this step — equals the rule's
+# "source_account". Rules are checked in order; the first match
+# wins. A row that matches no rule is left exactly as it is.
 #
-#   - Name contains one of the Revenue Management match terms
-#     (case-insensitive substring)      -> Revenue Management
-#   - everything else, blank Name included -> Software - Other
+# Matching (rules with "match_terms"):
+#   - Looks at the Name column only
+#   - Ignores capitalization
+#   - Whole words only: "b prime" matches "AMZN B Prime" but not
+#     "Web Prime"
+#   - Multi-word terms allow any spacing between the words:
+#     "price labs" matches "PriceLabs", "Price Labs",
+#     "PRICE  LABS"
 #
-# Only the short Revenue Management list is maintained — the
-# long, growing tail of software vendors is swept into
-# Software - Other. Nothing is left as bare "Software". The
-# match terms and both account names are editable in the UI.
+# Rules with "blank_name" / "transaction_type" / "amounts" match
+# on those fields instead of a search term (see AirDNA).
+#
+# What a rule changes:
+#   "new_name"    -> overwrites Name
+#   "new_account" -> overwrites Account Name
+#   A rule may set one or both. Anything not set is unchanged.
+#
+# The original values are kept in two new columns, "Original
+# Account Name" and "Original Name", filled on every row.
+#
+# To add a vendor: add one line to VENDOR_REMAP_RULES.
 # ============================================================
 
-SOFTWARE_SOURCE_ACCOUNT = "Software"
-SOFTWARE_REVENUE_MANAGEMENT_ACCOUNT = "Software - Revenue Management"
-SOFTWARE_OTHER_ACCOUNT = "Software - Other"
+VENDOR_REMAP_RULES = [
+    # ---------------- Software account ----------------
+    {
+        "source_account": "Software",
+        "match_terms": ["claude", "anthropic"],
+        "new_name": "Anthropic",
+    },
+    {
+        "source_account": "Software",
+        "match_terms": ["piecfomind"],
+        "new_name": "QuickBooks",
+    },
+    {
+        "source_account": "Software",
+        "match_terms": ["google workspace"],
+        "new_name": "Google Workspace",
+    },
+    {
+        "source_account": "Software",
+        "match_terms": ["b prime"],
+        "new_name": "Amazon Business Prime",
+    },
+    {
+        "source_account": "Software",
+        "match_terms": ["airroi"],
+        "new_name": "AirRoi",
+    },
+    {
+        # AirDNA posts as a Journal Entry with no Name. Matched on
+        # blank Name + Journal Entry + Amount of exactly 280 or
+        # -280 (a reversal). If AirDNA's price changes, update the
+        # amounts here.
+        "source_account": "Software",
+        "blank_name": True,
+        "transaction_type": "journal entry",
+        "amounts": [280.00, -280.00],
+        "new_name": "AirDNA",
+        "new_account": "Revenue Management",
+    },
+    {
+        # Name is left as is — only the account moves.
+        "source_account": "Software",
+        "match_terms": ["revup"],
+        "new_account": "Revenue Management",
+    },
+    {
+        # Name is left as is — only the account moves.
+        "source_account": "Software",
+        "match_terms": ["furnished finder"],
+        "new_account": "Ad & Marketing:Marketing",
+    },
+    # ----------- Revenue Management account -----------
+    {
+        "source_account": "Revenue Management",
+        "match_terms": ["price labs"],
+        "new_name": "PriceLabs",
+    },
+    {
+        "source_account": "Revenue Management",
+        "match_terms": ["pacer systems"],
+        "new_name": "Pacer",
+    },
+]
 
-# Software rows whose Name contains one of these terms
-# (case-insensitive) -> Revenue Management. Everything else in the
-# Software account -> Software - Other.
-DEFAULT_SOFTWARE_REVENUE_MANAGEMENT_TERMS = ["revup"]
+
+def build_vendor_match_pattern(term):
+    """
+    Whole-word, case-insensitive pattern for one match term.
+    Multi-word terms allow any spacing (including none) between
+    the words.
+    """
+
+    words = normalize_text(term).split()
+
+    pattern_body = r"\s*".join(re.escape(word) for word in words)
+
+    return re.compile(
+        r"(?<![a-z0-9])" + pattern_body + r"(?![a-z0-9])"
+    )
+
+
+VENDOR_REMAP_COMPILED = [
+    {
+        **rule,
+        "source_account_norm": normalize_account_name(
+            rule["source_account"]
+        ),
+        "patterns": [
+            build_vendor_match_pattern(term)
+            for term in rule.get("match_terms", [])
+        ],
+    }
+    for rule in VENDOR_REMAP_RULES
+]
+
+
+def find_vendor_remap_rule(
+    account_norm, name_value, transaction_type, amount
+):
+    """
+    First VENDOR_REMAP_RULES entry that matches this row, or None.
+    account_norm is the row's normalized ORIGINAL Account Name.
+    """
+
+    name_norm = normalize_text(name_value)
+    type_norm = normalize_text(transaction_type)
+
+    for rule in VENDOR_REMAP_COMPILED:
+
+        if rule["source_account_norm"] != account_norm:
+            continue
+
+        if rule.get("blank_name") and name_norm != "":
+            continue
+
+        if (
+            "transaction_type" in rule
+            and type_norm != normalize_text(rule["transaction_type"])
+        ):
+            continue
+
+        if "amounts" in rule:
+            if amount is None or not any(
+                abs(amount - target) < 0.005
+                for target in rule["amounts"]
+            ):
+                continue
+
+        if rule["patterns"] and not any(
+            pattern.search(name_norm) for pattern in rule["patterns"]
+        ):
+            continue
+
+        return rule
+
+    return None
 
 
 # ============================================================
@@ -2784,14 +2929,13 @@ if run_clicked:
             st.session_state["sos_results"] = results
 
             # A fresh Step 1 result invalidates any in-progress
-            # Step 1B/2/3 work (it was built from the previous
+            # Step 1B/2/4 work (it was built from the previous
             # dataframe) — clear it so later steps can't silently
             # keep operating on stale data.
             for key in list(st.session_state.keys()):
                 if (
-                    key in ("stage2_df", "stage3_df", "stage4_df")
+                    key in ("stage2_df", "stage4_df")
                     or key.startswith("stage2_")
-                    or key.startswith("stage3_")
                     or key.startswith("stage4_")
                     or key.startswith("owner_match_")
                 ):
@@ -2819,7 +2963,6 @@ if "sos_results" in st.session_state:
                 if (
                     key == "sos_results"
                     or key.startswith("stage2_")
-                    or key.startswith("stage3_")
                     or key.startswith("stage4_")
                     or key.startswith("owner_match_")
                 ):
@@ -3413,22 +3556,20 @@ if "sos_results" in st.session_state:
                         owner_match_df
                     )
 
-                    # Steps 2-4 snapshot their input from the step
-                    # above, and Step 2 caches its dataframe — so
-                    # owner matches applied here never reach them
+                    # Steps 2 and 4 snapshot their input from the
+                    # step above, and Step 2 caches its dataframe —
+                    # so owner matches applied here never reach them
                     # (or any export) unless we force a rebuild.
                     # Same idea as the reset in the "Run
-                    # processing" handler. Step 3/4 settings
-                    # (Revenue Management terms, payroll names)
-                    # live in their own session keys and are left
-                    # intact; only Step 2's manual Credit Card
+                    # processing" handler. Step 4 settings (payroll
+                    # names) live in their own session keys and are
+                    # left intact; only Step 2's manual Credit Card
                     # Clearing tags are dropped, and owner matching
                     # is meant to be finished before that work.
                     for stale_key in (
                         "stage2_df",
                         "stage2_auto_applied",
                         "stage2_editor_manual",
-                        "stage3_df",
                         "stage4_df",
                     ):
                         st.session_state.pop(stale_key, None)
@@ -3855,183 +3996,218 @@ if "sos_results" in st.session_state:
     )
 
     # ========================================================
-    # STEP 3 — SOFTWARE ACCOUNT VENDOR REMAPPING
+    # STEP 3 — VENDOR REMAPPING
     #
-    # Every row coded to the "Software" account is remapped:
-    #   - Name contains a Revenue Management match term
-    #     (case-insensitive substring) -> Revenue Management
-    #   - everything else, blank Name included -> Software - Other
-    #
-    # Only the short Revenue Management list is maintained; the
-    # growing tail of software vendors is swept into
-    # Software - Other. Nothing is left as bare "Software". Both
-    # the match terms and the two account names are editable.
+    # Applies VENDOR_REMAP_RULES (see top of file). Adds
+    # "Original Account Name" (left of Account Name) and
+    # "Original Name" (left of Name), filled on every row.
+    # "Account Name" and "Name" hold the final values.
+    # Rebuilt from the Step 2 output on every rerun.
     # ========================================================
 
     st.divider()
-    st.header("🏷️ Step 3 — Software Account Vendor Remapping")
+    st.header("🏷️ Step 3 — Vendor Remapping")
     st.caption(
-        "Every Software-account row is remapped: vendors matching "
-        "a Revenue Management term go to that account, everything "
-        "else goes to Software - Other."
+        "Standardizes vendor names in specific accounts, and moves "
+        "a few vendors to the right account. Original values are "
+        "kept in the Original Account Name and Original Name "
+        "columns."
     )
 
-    SOFTWARE_TERM_COLUMN = (
-        "Revenue Management match term (Name contains, "
-        "case-insensitive)"
-    )
-
-    if "stage3_revmgmt_terms" not in st.session_state:
-        st.session_state["stage3_revmgmt_terms"] = pd.DataFrame(
-            {
-                SOFTWARE_TERM_COLUMN: list(
-                    DEFAULT_SOFTWARE_REVENUE_MANAGEMENT_TERMS
+    with st.expander(
+        f"Remapping rules ({len(VENDOR_REMAP_RULES)})"
+    ):
+        rule_rows = []
+        for rule in VENDOR_REMAP_RULES:
+            if rule.get("blank_name"):
+                match_text = (
+                    "Blank Name + "
+                    f"{rule['transaction_type'].title()} + Amount "
+                    + " or ".join(
+                        f"{amount:g}" for amount in rule["amounts"]
+                    )
                 )
-            }
+            else:
+                match_text = "Name contains: " + ", ".join(
+                    rule["match_terms"]
+                )
+            rule_rows.append({
+                "Account": rule["source_account"],
+                "Match": match_text,
+                "New Name": rule.get("new_name", "(unchanged)"),
+                "New Account": rule.get(
+                    "new_account", "(unchanged)"
+                ),
+            })
+        st.dataframe(
+            pd.DataFrame(rule_rows),
+            use_container_width=True,
+            hide_index=True
         )
-
-    account_name_cols = st.columns(2)
-
-    with account_name_cols[0]:
-        revmgmt_account_name = st.text_input(
-            "Revenue Management account name",
-            value=SOFTWARE_REVENUE_MANAGEMENT_ACCOUNT,
-            key="stage3_revmgmt_account"
+        st.caption(
+            "Case-insensitive, whole words only. Rules are edited "
+            "in the code (VENDOR_REMAP_RULES)."
         )
-
-    with account_name_cols[1]:
-        other_account_name = st.text_input(
-            "Other account name (everything else in Software)",
-            value=SOFTWARE_OTHER_ACCOUNT,
-            key="stage3_other_account"
-        )
-
-    revmgmt_account_name = (
-        clean_text(revmgmt_account_name)
-        or SOFTWARE_REVENUE_MANAGEMENT_ACCOUNT
-    )
-    other_account_name = (
-        clean_text(other_account_name) or SOFTWARE_OTHER_ACCOUNT
-    )
-
-    st.markdown(
-        "**Revenue Management vendors** — a Software row whose "
-        "Name contains any term below is remapped to the Revenue "
-        "Management account. Add or remove rows as needed:"
-    )
-
-    revmgmt_terms_editor_df = st.data_editor(
-        st.session_state["stage3_revmgmt_terms"],
-        num_rows="dynamic",
-        use_container_width=True,
-        hide_index=True,
-        key="stage3_revmgmt_terms_editor"
-    )
-
-    st.session_state["stage3_revmgmt_terms"] = (
-        revmgmt_terms_editor_df
-    )
-
-    revenue_management_terms = [
-        normalize_text(term)
-        for term in revmgmt_terms_editor_df[
-            SOFTWARE_TERM_COLUMN
-        ].tolist()
-        if normalize_text(term) != ""
-    ]
 
     stage3_df = stage2_df.copy()
 
-    software_mask = get_account_match_mask(
-        stage3_df,
-        account_name_col,
-        SOFTWARE_SOURCE_ACCOUNT
-    )
+    if not (name_col and transaction_type_col):
 
-    software_index = stage3_df.loc[software_mask].index
-
-    if len(software_index) == 0:
-
-        st.info(
-            "No rows are currently coded to the Software "
-            "account."
+        st.error(
+            "The 'Name' and 'Transaction Type' columns are "
+            "required for Step 3. Rows passed through unchanged."
         )
 
     else:
 
-        vendor_values = (
-            stage3_df.loc[software_index, name_col]
-            .map(clean_text)
+        original_account_values = stage3_df[account_name_col].copy()
+        original_name_values = stage3_df[name_col].copy()
+
+        original_account_norm = original_account_values.map(
+            normalize_account_name
         )
 
-        normalized_vendor_values = vendor_values.map(
-            normalize_text
-        )
+        rule_account_norms = {
+            rule["source_account_norm"]
+            for rule in VENDOR_REMAP_COMPILED
+        }
 
-        def is_revenue_management_vendor(vendor_key):
-            return any(
-                term in vendor_key
-                for term in revenue_management_terms
+        candidate_index = original_account_norm[
+            original_account_norm.isin(rule_account_norms)
+        ].index
+
+        changed_index = []
+
+        for row_index in candidate_index:
+
+            rule = find_vendor_remap_rule(
+                original_account_norm[row_index],
+                stage3_df.loc[row_index, name_col],
+                stage3_df.loc[row_index, transaction_type_col],
+                parse_amount(stage3_df.loc[row_index, amount_col])
             )
 
-        revmgmt_row_mask = normalized_vendor_values.map(
-            is_revenue_management_vendor
+            if rule is None:
+                continue
+
+            if "new_name" in rule:
+                stage3_df.loc[row_index, name_col] = rule["new_name"]
+
+            if "new_account" in rule:
+                stage3_df.loc[row_index, account_name_col] = (
+                    rule["new_account"]
+                )
+
+            changed_index.append(row_index)
+
+        stage3_df.insert(
+            stage3_df.columns.get_loc(account_name_col),
+            "Original Account Name",
+            original_account_values
+        )
+        stage3_df.insert(
+            stage3_df.columns.get_loc(name_col),
+            "Original Name",
+            original_name_values
         )
 
-        revmgmt_index = revmgmt_row_mask[revmgmt_row_mask].index
-        other_index = revmgmt_row_mask[~revmgmt_row_mask].index
+        name_changed_count = int(
+            (
+                stage3_df.loc[changed_index, name_col]
+                != stage3_df.loc[changed_index, "Original Name"]
+            ).sum()
+        ) if changed_index else 0
 
-        stage3_df.loc[revmgmt_index, account_name_col] = (
-            revmgmt_account_name
-        )
-        stage3_df.loc[other_index, account_name_col] = (
-            other_account_name
-        )
+        account_changed_count = int(
+            (
+                stage3_df.loc[changed_index, account_name_col]
+                != stage3_df.loc[
+                    changed_index, "Original Account Name"
+                ]
+            ).sum()
+        ) if changed_index else 0
 
-        metric_cols = st.columns(2)
-        metric_cols[0].metric(
-            f"→ {revmgmt_account_name}", f"{len(revmgmt_index):,}"
-        )
-        metric_cols[1].metric(
-            f"→ {other_account_name}", f"{len(other_index):,}"
-        )
+        v1, v2, v3, v4 = st.columns(4)
+        v1.metric("Rows checked", f"{len(candidate_index):,}")
+        v2.metric("Rows remapped", f"{len(changed_index):,}")
+        v3.metric("Names changed", f"{name_changed_count:,}")
+        v4.metric("Accounts changed", f"{account_changed_count:,}")
 
-        def vendor_breakdown(index):
-            return (
-                vendor_values.loc[index]
-                .replace("", "(blank vendor)")
-                .value_counts()
-                .rename_axis("Vendor (Name)")
+        if changed_index:
+
+            st.markdown("**Changes made**")
+
+            changes_df = (
+                stage3_df.loc[
+                    changed_index,
+                    [
+                        "Original Account Name", account_name_col,
+                        "Original Name", name_col,
+                    ]
+                ]
+                .replace("", "(blank)")
+                .groupby(
+                    [
+                        "Original Account Name", account_name_col,
+                        "Original Name", name_col,
+                    ],
+                    dropna=False
+                )
+                .size()
                 .reset_index(name="Rows")
-            )
-
-        st.markdown(
-            f"**Swept into {other_account_name}** — check for any "
-            "vendor that should be Revenue Management:"
-        )
-        other_breakdown_df = vendor_breakdown(other_index)
-        st.dataframe(
-            other_breakdown_df,
-            use_container_width=True,
-            hide_index=True,
-            height=min(360, 60 + 35 * len(other_breakdown_df))
-        )
-
-        if len(revmgmt_index) > 0:
-            st.markdown(
-                f"**Mapped to {revmgmt_account_name}:**"
-            )
-            revmgmt_breakdown_df = vendor_breakdown(revmgmt_index)
-            st.dataframe(
-                revmgmt_breakdown_df,
-                use_container_width=True,
-                hide_index=True,
-                height=min(
-                    240, 60 + 35 * len(revmgmt_breakdown_df)
+                .rename(columns={
+                    account_name_col: "New Account Name",
+                    name_col: "New Name",
+                })
+                .sort_values(
+                    ["Original Account Name", "New Name"]
                 )
             )
 
-    st.session_state["stage3_df"] = stage3_df
+            st.dataframe(
+                changes_df,
+                use_container_width=True,
+                hide_index=True,
+                height=min(420, 60 + 35 * len(changes_df))
+            )
+
+        else:
+            st.info("No rows matched any remapping rule.")
+
+        unchanged_index = [
+            row_index for row_index in candidate_index
+            if row_index not in set(changed_index)
+        ]
+
+        if unchanged_index:
+
+            st.markdown(
+                "**Not remapped** — names in these accounts that "
+                "didn't match any rule (left as is). Check for "
+                "anything that should get a rule:"
+            )
+
+            unchanged_df = (
+                stage3_df.loc[
+                    unchanged_index,
+                    [account_name_col, name_col]
+                ]
+                .replace("", "(blank)")
+                .value_counts()
+                .reset_index(name="Rows")
+                .rename(columns={
+                    account_name_col: "Account",
+                    name_col: "Name",
+                })
+                .sort_values(["Account", "Rows"], ascending=[True, False])
+            )
+
+            st.dataframe(
+                unchanged_df,
+                use_container_width=True,
+                hide_index=True,
+                height=min(420, 60 + 35 * len(unchanged_df))
+            )
 
     st.subheader("Step 3 output")
     st.dataframe(
@@ -4041,7 +4217,7 @@ if "sos_results" in st.session_state:
     )
 
     stage3_output_filename = results["output_filename"].replace(
-        "_mapped.csv", "_remapped_v2.csv"
+        "_mapped.csv", "_vendor_remapped.csv"
     )
 
     st.download_button(
